@@ -1,0 +1,13 @@
+networkx
+numpy
+gym
+git+https://github.com/hashberg-io/pauliopt.git@main
+torch
+torchvision
+torchaudio
+scipy
+qiskit~=0.39
+matplotlib
+pytorch-lightning
+tensorboard
+pandas
