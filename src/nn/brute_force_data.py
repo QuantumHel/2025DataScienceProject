@@ -51,16 +51,14 @@ def get_best_cnots(clifford_tableau: CliffordTableau, topo: Topology = None) -> 
         def pick_pivot_callback(G, remaining: "CliffordTableau", remaining_rows: List[int], choice_fn=min):
             return next(perm_iter)
 
-        qc, _ = synthesize_tableau_perm_row_col(clifford_tableau, topo, pick_pivot_callback=pick_pivot_callback)
+        qc = synthesize_tableau_perm_row_col(clifford_tableau, topo, pick_pivot_callback=pick_pivot_callback)
         qc.final_permutation = None
 
-        cx_count = qc.to_qiskit().count_ops().get("cx", float("inf"))
+        cx_count = qc.to_qiskit().count_ops().get("cx", 0)
 
         permutations_with_cx_count.append((permutation, cx_count))
 
     best_cx_count = min(cx_count for _, cx_count in permutations_with_cx_count)
-    if best_cx_count == float("inf"):
-        return []
     best_perms = [(list(perm), cx_count) for perm, cx_count in permutations_with_cx_count if cx_count == best_cx_count]
     return best_perms
 

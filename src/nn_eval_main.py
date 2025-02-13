@@ -43,9 +43,28 @@ def our_compilation(circuit: Circuit, topology: Topology, n_rep: int):
     clifford_tableau = CliffordTableau(circuit.n_qubits)
     clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
 
-    circ_out, _ = synthesize_tableau_perm_row_col(clifford_tableau, topology)
+    circ_out = synthesize_tableau_perm_row_col(clifford_tableau, topology)
     return {"n_rep": n_rep} | collect_circuit_data(circ_out) | {"method": "normal_heuristic"}
 
+
+def random_compilation(circuit: Circuit, topology: Topology, n_rep: int):
+    """
+    Brute force compilation of the circuit (may be slow for >=4 qubits!)
+    :param circuit:
+    :param topology:
+    :param n_rep:
+    :return:
+    """
+    clifford_tableau = CliffordTableau(circuit.n_qubits)
+    clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
+
+    def pick_pivot_callback(G, remaining: "CliffordTableau", remaining_rows: List[int], choice_fn=min):
+        row = np.random.choice(remaining_rows)
+        col = row
+        return row, col
+
+    circ_out = synthesize_tableau_perm_row_col(clifford_tableau, topology, pick_pivot_callback=pick_pivot_callback)
+    return {"n_rep": n_rep} | collect_circuit_data(circ_out) | {"method": "random"}
 
 def optimal_compilation(circuit: Circuit, topology: Topology, n_rep: int):
     """
@@ -65,8 +84,9 @@ def optimal_compilation(circuit: Circuit, topology: Topology, n_rep: int):
         row, col = next(best_permutation)
         return row, col
 
-    circ_out, _ = synthesize_tableau_perm_row_col(clifford_tableau, topology, pick_pivot_callback=pick_pivot_callback)
+    circ_out = synthesize_tableau_perm_row_col(clifford_tableau, topology, pick_pivot_callback=pick_pivot_callback)
     return {"n_rep": n_rep} | collect_circuit_data(circ_out) | {"method": "optimum"}
+
 
 
 def main(n_qubits: int = 4, nr_gates: int = 1000):
@@ -89,6 +109,10 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
         df_dictionary = pd.DataFrame([optimal_compilation(circuit.copy(), topo, i)])
         df = pd.concat([df, df_dictionary], ignore_index=True)
         print("OPTIMUM", df_dictionary["cx"])
+
+        df_dictionary = pd.DataFrame([random_compilation(circuit.copy(), topo, i)])
+        df = pd.concat([df, df_dictionary], ignore_index=True)
+        print("Random", df_dictionary["cx"])
 
     df.to_csv("test_clifford_synthesis.csv", index=False)
     print(df.groupby("method").mean())

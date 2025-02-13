@@ -15,6 +15,7 @@ def main(n_qubits=4, n_gates=100, n_episodes=1000, batch_size=2000):
     env.reset()
     cnots, score = get_best_cnots(env.clifford_tableau_to_reduce)[0]
     for episode in range(n_episodes):
+        print(f"Episode: {episode}")
         state = env.reset()
         done = False
         while not done:

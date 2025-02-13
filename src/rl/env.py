@@ -109,7 +109,7 @@ class CliffordTableauEnv(gym.Env[Tuple[int, int], np.ndarray]):
 
             done = True
 
-        reward = np.exp(-current_circuit.to_qiskit().count_ops().get("cx", float("inf")))
+        reward = np.exp(-current_circuit.to_qiskit().count_ops().get("cx", 0))
         return (self._get_obs(), self.allowed_rows, self.allowed_cols), reward, done, {}
 
     def render(self) -> Optional[Union[RenderFrame, List[RenderFrame]]]:
