@@ -1,0 +1,261 @@
+Model: BestQubitModel(
+  (fc1): Linear(in_features=32, out_features=128, bias=True)
+  (hidden_layers_list): ModuleList(
+    (0-2): 3 x Linear(in_features=128, out_features=128, bias=True)
+  )
+  (fc_out): Linear(in_features=128, out_features=16, bias=True)
+  (dropout): Dropout(p=0.3, inplace=False)
+)
+Number of hidden layers: 4
+Optimizer: Adam (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.9, 0.999)
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    lr: 0.0001
+    maximize: False
+    weight_decay: 0
+)
+Number of epochs: 4709
+Patience: 1000
+Best training loss: 0.0870
+Best validation loss: 0.2626
+
+================================================================================
+
+Model: BestQubitModel(
+  (fc1): Linear(in_features=32, out_features=128, bias=True)
+  (hidden_layers_list): ModuleList(
+    (0-2): 3 x Linear(in_features=128, out_features=128, bias=True)
+  )
+  (fc_out): Linear(in_features=128, out_features=16, bias=True)
+  (dropout): Dropout(p=0.3, inplace=False)
+)
+Number of hidden layers: 4
+Optimizer: Adam (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.9, 0.999)
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    lr: 0.0001
+    maximize: False
+    weight_decay: 0
+)
+Number of epochs: 3968
+Patience: 1000
+Best training loss: 0.1179
+Best validation loss: 0.2706
+
+================================================================================
+
+Model: BestQubitModel(
+  (fc1): Linear(in_features=32, out_features=128, bias=True)
+  (hidden_layers_list): ModuleList(
+    (0-2): 3 x Linear(in_features=128, out_features=128, bias=True)
+  )
+  (fc_out): Linear(in_features=128, out_features=16, bias=True)
+  (dropout): Dropout(p=0.3, inplace=False)
+)
+Number of hidden layers: 4
+Optimizer: Adam (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.9, 0.999)
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    lr: 0.0001
+    maximize: False
+    weight_decay: 0.0001
+)
+Number of epochs: 4204
+Patience: 1000
+Best training loss: 0.0967
+Best validation loss: 0.2644
+
+================================================================================
+
+Model: BestQubitModel(
+  (fc1): Linear(in_features=32, out_features=128, bias=True)
+  (hidden_layers_list): ModuleList(
+    (0-2): 3 x Linear(in_features=128, out_features=128, bias=True)
+  )
+  (fc_out): Linear(in_features=128, out_features=16, bias=True)
+  (dropout): Dropout(p=0.3, inplace=False)
+)
+Number of hidden layers: 4
+Optimizer: Adam (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.9, 0.999)
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    lr: 0.0001
+    maximize: False
+    weight_decay: 0.0001
+)
+Number of epochs: 3671
+Patience: 1000
+Best training loss: 0.1028
+Best validation loss: 0.2579
+
+================================================================================
+
+Model: BestQubitModel(
+  (fc1): Linear(in_features=32, out_features=128, bias=True)
+  (hidden_layers_list): ModuleList(
+    (0-2): 3 x Linear(in_features=128, out_features=128, bias=True)
+  )
+  (fc_out): Linear(in_features=128, out_features=16, bias=True)
+  (dropout): Dropout(p=0.3, inplace=False)
+)
+Number of hidden layers: 4
+Optimizer: Adam (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.9, 0.999)
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    lr: 0.0001
+    maximize: False
+    weight_decay: 0.0001
+)
+Number of epochs: 4903
+Patience: 1000
+Best training loss: 0.1027
+Best validation loss: 0.2825
+
+================================================================================
+
+Model: BestQubitModel(
+  (fc1): Linear(in_features=32, out_features=128, bias=True)
+  (hidden_layers_list): ModuleList(
+    (0-2): 3 x Linear(in_features=128, out_features=128, bias=True)
+  )
+  (fc_out): Linear(in_features=128, out_features=16, bias=True)
+  (dropout): Dropout(p=0.3, inplace=False)
+)
+Number of hidden layers: 4
+Optimizer: AdamW (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.9, 0.999)
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    lr: 0.0001
+    maximize: False
+    weight_decay: 0.0001
+)
+Number of epochs: 2022
+Patience: 1000
+Best training loss: 0.1695
+Best validation loss: 0.3072
+
+================================================================================
+
+Model: BestQubitModel(
+  (fc1): Linear(in_features=32, out_features=128, bias=True)
+  (hidden_layers_list): ModuleList(
+    (0-2): 3 x Linear(in_features=128, out_features=128, bias=True)
+  )
+  (fc_out): Linear(in_features=128, out_features=16, bias=True)
+  (dropout): Dropout(p=0.3, inplace=False)
+)
+Number of hidden layers: 4
+Optimizer: AdamW (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.9, 0.999)
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    lr: 0.0001
+    maximize: False
+    weight_decay: 0.0001
+)
+Number of epochs: 3256
+Patience: 1000
+Best training loss: 0.1342
+Best validation loss: 0.2927
+
+================================================================================
+
+Model: BestQubitModel(
+  (fc1): Linear(in_features=32, out_features=128, bias=True)
+  (hidden_layers_list): ModuleList(
+    (0-2): 3 x Linear(in_features=128, out_features=128, bias=True)
+  )
+  (fc_out): Linear(in_features=128, out_features=16, bias=True)
+  (dropout): Dropout(p=0.3, inplace=False)
+)
+Number of hidden layers: 4
+Optimizer: AdamW (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.9, 0.999)
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    lr: 0.0001
+    maximize: False
+    weight_decay: 0.0001
+)
+Number of epochs: 4499
+Patience: 1000
+Best training loss: 0.0847
+Best validation loss: 0.2784
+
+================================================================================
+
+Model: BestQubitModel(
+  (fc1): Linear(in_features=32, out_features=128, bias=True)
+  (hidden_layers_list): ModuleList(
+    (0-2): 3 x Linear(in_features=128, out_features=128, bias=True)
+  )
+  (fc_out): Linear(in_features=128, out_features=16, bias=True)
+  (dropout): Dropout(p=0.3, inplace=False)
+)
+Number of hidden layers: 4
+Optimizer: AdamW (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.9, 0.999)
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    lr: 0.0001
+    maximize: False
+    weight_decay: 0.0001
+)
+Number of epochs: 4616
+Patience: 1000
+Best training loss: 0.0907
+Best validation loss: 0.2940
+
+================================================================================
+
