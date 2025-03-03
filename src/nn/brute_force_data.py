@@ -191,7 +191,7 @@ def generate_data_as_project_description(clifford_tableau: CliffordTableau, topo
 
 def generate_dataset_ct(nr_samples: int, qubits: List[int],
                         gates: List[int],
-                        topo_factory: Callable[[int], Topology] = None, labels_as_described:bool = False, preprocessing_type: PreprocessingType = PreprocessingType.ORIGINAL) -> Tuple[torch.Tensor, torch.Tensor]:
+                        topo_factory: Callable[[int], Topology] = None, labels_as_described:bool = True, preprocessing_type: PreprocessingType = PreprocessingType.ORIGINAL) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generate a dataset defined by labels_as_described and preprocessing_type.
     
