@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class BestQubitModel(nn.Module):
-    def __init__(self, n_size=4, hidden_layers=6, hidden_size=64, dropout_rate=0.5):
+    def __init__(self, n_size=4, hidden_layers=3, hidden_size=128, dropout_rate=0.5):
         super(BestQubitModel, self).__init__()
         input_size = 2 * n_size * n_size  # 32 features
         output_size = n_size * n_size     # 16 outputs

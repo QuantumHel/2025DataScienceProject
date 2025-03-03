@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F  # Import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from src.nn.best_qubit_model import BestQubitModel
 
@@ -81,6 +82,12 @@ def log_experiment_details(filename, model, optimizer, best_train_loss, best_val
         f.write(f"Best validation loss: {best_val_loss:.4f}\n")
         f.write("\n" + "="*80 + "\n\n")
 
+def custom_loss(output, target):
+    mse_loss = nn.MSELoss()(output, target)
+    penalty = torch.sum(F.relu(-output))  # Penalize negative values
+    return mse_loss + penalty
+
+
 def train_model(model, train_loader, criterion, optimizer, X_train, y_train, X_val, y_val, n_epochs=30000, verbose=True, patience=1000, log_file="experiment_log.txt"):
     """
     Main training loop for the model.
@@ -135,12 +142,13 @@ def train_model(model, train_loader, criterion, optimizer, X_train, y_train, X_v
             print(f'Epoch {epoch}, Training Loss: {avg_loss:.4f}, '
                   f'Validation Loss: {val_loss:.4f}, LR: {current_lr:.6f}')
             with torch.no_grad():
-                test_input = X_train[0:1]
-                pred = model(test_input)
-                print("Predicted values:")
-                print(pred[0, 0])
-                print("Actual values:")
-                print(y_train[0, 0])
+                for i in range(2):  # Print predictions for the first i examples
+                    test_input = X_train[i:i+1]
+                    pred = model(test_input)
+                    print(f"Example {i+1} - Predicted values:")
+                    print(pred[0, 0])
+                    print(f"Example {i+1} - Actual values:")
+                    print(y_train[i, 0])
 
         # Save only the best model so far and check early stopping
         if val_loss < best_val_loss:
@@ -157,7 +165,7 @@ def train_model(model, train_loader, criterion, optimizer, X_train, y_train, X_v
             break
 
     save_loss_plot(train_losses, val_losses)
-    model.load_state_dict(torch.load("best_qubit_model_weights.pt", weights_only=True))
+    model.load_state_dict(torch.load("best_qubit_model_weights.pt"))
 
     # Log experiment details when a new best validation loss is achieved
     log_experiment_details(log_file, model, optimizer, best_train_loss, best_val_loss, epoch, patience)
@@ -171,9 +179,9 @@ def main():
     X_train, y_train, X_val, y_val = load_data(train_path, val_path)
     
     # Create model, criterion, optimizer
-    model = BestQubitModel(n_size=4, hidden_layers=4, hidden_size=128, dropout_rate=0.3)
-    criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    model = BestQubitModel(n_size=4, hidden_layers=3, hidden_size=128, dropout_rate=0.5)
+    criterion = custom_loss  # Use the custom loss function
+    optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-4)
     
     # Create data loader
     train_loader = create_dataloaders(X_train, y_train, batch_size=32)
