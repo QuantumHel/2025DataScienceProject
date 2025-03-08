@@ -22,6 +22,17 @@ def random_clifford_circuit(nr_gates=20, nr_qubits=4, gate_choice=None) -> Circu
     :param nr_gates:
     :param nr_qubits:
     :param gate_choice: Subset of ["CX", "H", "S", "V", "CY", "CZ", "Sdg", "Vdg", "X", "Y", "Z"]
+        CX: Controlled-NOT (CNOT) gate
+        H: Hadamard gate
+        S: Phase gate
+        V: V gate (also known as the √X gate, square root of X gate)
+        CY: Controlled-Y gate
+        CZ: Controlled-Z gate
+        Sdg: S-dagger gate (inverse of the S gate)
+        Vdg: V-dagger gate (inverse of the V gate)
+        X: Pauli-X gate (also known as the NOT gate)
+        Y: Pauli-Y gate
+        Z: Pauli-Z gate
     :return:
     """
     qc = Circuit(nr_qubits)
