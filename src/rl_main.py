@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import torch
 
 from src.nn.brute_force_data import get_best_cnots
 from src.rl.agent import DQNAgent
@@ -13,19 +14,17 @@ def main(n_qubits=4, n_gates=100, n_episodes=1000, batch_size=2000):
     scores_episode = []
 
     env.reset()
-    cnots, score = get_best_cnots(env.clifford_tableau_to_reduce)[0]
+    cnots, score = get_best_cnots(env.clifford_tableau_to_reduce, env.topology)[0]
     for episode in range(n_episodes):
         print(f"Episode: {episode}")
         state = env.reset()
         done = False
         while not done:
             action = agent.act(*state)
-
             next_state, reward, done, _ = env.step(action)
+            agent.remember(state, action, reward, next_state, done)
             if done:
                 break
-
-            agent.remember(state, action, reward, next_state, done)
             state = next_state
             if len(agent.memory) > batch_size:
                 agent.replay(batch_size)
@@ -42,6 +41,7 @@ def main(n_qubits=4, n_gates=100, n_episodes=1000, batch_size=2000):
     plt.ylabel("#CX")
     plt.legend()
     plt.savefig("./dqn_agent.png")
+    torch.save(agent.model.state_dict(), "dqn_model.pth")
 
 
 if __name__ == '__main__':
