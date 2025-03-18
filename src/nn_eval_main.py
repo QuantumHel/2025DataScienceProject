@@ -12,9 +12,11 @@ from pauliopt.topologies import Topology
 
 from src.nn.brute_force_data import get_best_cnots
 from src.utils import random_hscx_circuit, tableau_from_circuit
-
+#rl imports
 from src.nn.best_qubit_model import BestQubitModel
 from src.rl.agent import DuelingDQN
+from src.rl.agent import DQNAgent
+from src.rl.env import CliffordTableauEnv
 
 # Suppress all overflow warnings globally
 np.seterr(over='ignore')
@@ -135,47 +137,29 @@ def nn_compilation(circuit: Circuit, topology: Topology, n_rep: int):
 def rl_compilation(circuit: Circuit, topology: Topology, n_rep: int):
 
     '''Compilation using trained rl model'''
-
-
-    model = DuelingDQN(input_channels=3, board_size=circuit.n_qubits)
-    model.load_state_dict(torch.load("dqn_model.pth"))
-    model.eval()
-
     n_qubits = circuit.n_qubits
+
+    model = DuelingDQN(input_channels=3, board_size=n_qubits)
+    model.load_state_dict(torch.load("dqn_model.pth"))
+    agent = DQNAgent(n_qubits=n_qubits, epsilon=0)
+    agent.model = model
+  
     clifford_tableau = CliffordTableau(n_qubits)
     clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
-
-    # Reshape x_mat and z_mat to (n, n)
-    x_mat = np.array(clifford_tableau.x_matrix).reshape(n_qubits, n_qubits)
-    z_mat = np.array(clifford_tableau.z_matrix).reshape(n_qubits, n_qubits)
-
-    # Create an input tensor of shape [1, 3, n, n]
-    input_tensor = torch.zeros(1, 3, n_qubits, n_qubits, dtype=torch.float32)
-    input_tensor[0, 0] = torch.tensor(x_mat, dtype=torch.float32)
-    input_tensor[0, 1] = torch.tensor(z_mat, dtype=torch.float32)
-    # The third channel remains zero (or filled as needed)
-
-    with torch.no_grad():
-        output = model(input_tensor)
-        output = torch.round(output).int().numpy()
-
-    # Ensure the output matrix has the expected shape (n_qubits x n_qubits)
-    output = output.reshape(n_qubits, n_qubits)
-
-    # Use a large integer value to represent infinity
-    int_inf = np.iinfo(np.int32).max
-
-    # Collect row and column combinations based on the lowest values
     combinations = []
-    while not np.all(output == -int_inf):
-        max_index = np.unravel_index(np.argmax(output, axis=None), output.shape) #note picks the first occurence in ties
-        combinations.append(max_index)
-        output[max_index[0], :] = -int_inf
-        output[:, max_index[1]] = -int_inf
+    env = CliffordTableauEnv(n_qubits)
+    state = env.set(circuit)
+    done = False
+    while not done:
+        action = agent.act(*state)
+        next_state, reward, done, _ = env.step(action)
+        combinations.append(action)
+        print(reward)
 
     combination_iterator = iter(combinations)
 
     def pick_pivot_callback(G, remaining: "CliffordTableau", remaining_rows: List[int], choice_fn=min):
+
         row, col = next(combination_iterator)
         return row, col
     

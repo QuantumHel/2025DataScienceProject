@@ -58,6 +58,25 @@ class CliffordTableauEnv(gym.Env[Tuple[int, int], np.ndarray]):
         self.qubits_reduced = 0
 
         return self._get_obs(), self.allowed_rows, self.allowed_cols
+    
+    def set(self, circuit, **kwargs):
+        """
+
+        :param kwargs:
+        :return:
+        """
+        circuit = circuit
+        clifford_tableau = CliffordTableau(self.n_qubits)
+        clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
+        self.clifford_tableau_to_reduce = clifford_tableau.inverse()
+        self.final_circuit = Circuit(self.n_qubits)
+        self.graph = self.topology.to_nx
+        self.allowed_rows = list(range(self.n_qubits))
+        self.allowed_cols = list(range(self.n_qubits))
+        self.adjacency_matrix = nx.adjacency_matrix(self.graph).toarray()
+        self.qubits_reduced = 0
+
+        return self._get_obs(), self.allowed_rows, self.allowed_cols
 
     def get_current_stats(self) -> float:
         return self.final_circuit.to_qiskit().count_ops().get("cx", 0)
