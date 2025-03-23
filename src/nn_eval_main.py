@@ -3,7 +3,6 @@
 import warnings
 from typing import List
 
-import torch
 import numpy as np
 import pandas as pd
 from pauliopt.circuits import Circuit
@@ -14,9 +13,15 @@ from pauliopt.topologies import Topology
 from src.nn.brute_force_data import get_best_cnots
 from src.utils import random_hscx_circuit, tableau_from_circuit
 
-from src.nn.best_qubit_model import BestQubitModel
-from src.nn.preprocess_data import PREPROCESSING_SCRIPTS, PreprocessingType
+# from src.nn.permutation_pred3 import predict_permutation, pretrain_a_model, FlexibleGNN
 
+# from src.nn.permutation_pred2 import (
+#     pretrain_a_model,
+#     predict_permutation,
+#     PermutationConstrainedGNN,
+# )
+
+from src.nn.permutation_pred2_optm import predict_permutation, pretrain_a_model, PermutationGNN
 
 # Suppress all overflow warnings globally
 np.seterr(over="ignore")
@@ -97,7 +102,10 @@ def optimal_compilation(circuit: Circuit, topology: Topology, n_rep: int):
     best_permutation, score = get_best_cnots(
         clifford_tableau.inverse().inverse(), topology
     )[0]
-    print(f"best_permutation: {best_permutation}")
+
+    # print_perm = get_best_cnots(clifford_tableau.inverse().inverse(), topology)
+    # print(f"best_permutation: {print_perm}")
+
     best_permutation = iter(best_permutation)
 
     def pick_pivot_callback(
@@ -112,6 +120,26 @@ def optimal_compilation(circuit: Circuit, topology: Topology, n_rep: int):
     return {"n_rep": n_rep} | collect_circuit_data(circ_out) | {"method": "optimum"}
 
 
+def dummy_perm_compilation(
+    circuit: Circuit, topology: Topology, n_rep: int, model: PermutationGNN
+):
+    clifford_tableau = CliffordTableau(circuit.n_qubits)
+    clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
+    best_permutation = predict_permutation(model, clifford_tableau)
+    best_permutation = iter(best_permutation)
+
+    def pick_pivot_callback(
+        G, remaining: "CliffordTableau", remaining_rows: List[int], choice_fn=min
+    ):
+        row, col = next(best_permutation)
+        return row, col
+
+    circ_out = synthesize_tableau_perm_row_col(
+        clifford_tableau, topology, pick_pivot_callback=pick_pivot_callback
+    )
+    return {"n_rep": n_rep} | collect_circuit_data(circ_out) | {"method": "dummy-perm"}
+
+
 def main(n_qubits: int = 4, nr_gates: int = 1000):
     """
     Execute a single experiment with random clifford circuits and store the respective gate count into a dataframe
@@ -120,11 +148,14 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
     :return:
     """
 
+    # Pre-train a model
+    model = pretrain_a_model()
+
     df = pd.DataFrame(
         columns=["n_rep", "num_qubits", "method", "h", "s", "cx", "depth"]
     )
     topo = Topology.complete(n_qubits)
-    for i in range(20):
+    for i in range(50):
         circuit = random_hscx_circuit(nr_qubits=n_qubits, nr_gates=nr_gates)
 
         # Our compilation e.g. the baseline from the paper
@@ -142,10 +173,17 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
         df = pd.concat([df, df_dictionary], ignore_index=True)
         print("Random", df_dictionary["cx"])
 
-        # Group's first ANN compilation
-        df_dictionary = pd.DataFrame([nn_compilation(circuit.copy(), topo, i)])
+        # # Group's first ANN compilation
+        # df_dictionary = pd.DataFrame([nn_compilation(circuit.copy(), topo, i)])
+        # df = pd.concat([df, df_dictionary], ignore_index=True)
+        # print("NN", df_dictionary["cx"])
+
+        # Dummy_perm compilation
+        df_dictionary = pd.DataFrame(
+            [dummy_perm_compilation(circuit.copy(), topo, i, model)]
+        )
         df = pd.concat([df, df_dictionary], ignore_index=True)
-        print("NN", df_dictionary["cx"])
+        print("Dummy-perm", df_dictionary["cx"])
 
     # Convert the cx column to a numerical type
     df["cx"] = pd.to_numeric(df["cx"])
