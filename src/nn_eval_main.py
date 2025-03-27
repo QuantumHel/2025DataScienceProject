@@ -151,10 +151,11 @@ def rl_compilation(circuit: Circuit, topology: Topology, n_rep: int):
     state = env.set(circuit)
     done = False
     while not done:
+        print("step")
         action = agent.act(*state)
         next_state, reward, done, _ = env.step(action)
         combinations.append(action)
-        print(reward)
+        print(combinations)
 
     combination_iterator = iter(combinations)
 
@@ -198,10 +199,10 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
         df = pd.concat([df, df_dictionary], ignore_index=True)
         print("Random", df_dictionary["cx"])
 
-        # Group's first ANN compilation
-        df_dictionary = pd.DataFrame([nn_compilation(circuit.copy(), topo, i)])
-        df = pd.concat([df, df_dictionary], ignore_index=True)
-        print("NN", df_dictionary["cx"])
+        # # Group's first ANN compilation
+        # df_dictionary = pd.DataFrame([nn_compilation(circuit.copy(), topo, i)])
+        # df = pd.concat([df, df_dictionary], ignore_index=True)
+        # print("NN", df_dictionary["cx"])
 
         # Group's RL compilation
         df_dictionary = pd.DataFrame([rl_compilation(circuit.copy(), topo, i)])
