@@ -21,7 +21,19 @@ from src.utils import random_hscx_circuit, tableau_from_circuit
 #     PermutationConstrainedGNN,
 # )
 
-from src.nn.permutation_pred2_optm import predict_permutation, pretrain_a_model, PermutationGNN
+# from src.nn.permutation_pred2_optm import predict_permutation, pretrain_a_model, PermutationGNN
+
+# from src.nn.permutation_pred2 import (
+#     predict_permutation,
+#     pretrain_a_model_from_file,
+#     SequentialPermutationGNN,
+# )
+
+from src.nn.permutation_math import (
+    predict_permutation,
+    pretrain_a_model_from_file,
+    OrderedPermutationTransformer,
+)
 
 # Suppress all overflow warnings globally
 np.seterr(over="ignore")
@@ -121,12 +133,15 @@ def optimal_compilation(circuit: Circuit, topology: Topology, n_rep: int):
 
 
 def dummy_perm_compilation(
-    circuit: Circuit, topology: Topology, n_rep: int, model: PermutationGNN
+    circuit: Circuit,
+    topology: Topology,
+    n_rep: int,
+    model: OrderedPermutationTransformer,
 ):
     clifford_tableau = CliffordTableau(circuit.n_qubits)
     clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
     best_permutation = predict_permutation(model, clifford_tableau)
-    best_permutation = iter(best_permutation)
+    best_permutation = iter(best_permutation[0])
 
     def pick_pivot_callback(
         G, remaining: "CliffordTableau", remaining_rows: List[int], choice_fn=min
@@ -149,7 +164,7 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
     """
 
     # Pre-train a model
-    model = pretrain_a_model()
+    model = pretrain_a_model_from_file("nn/training_data_perm.pkl", max_samples=None)
 
     df = pd.DataFrame(
         columns=["n_rep", "num_qubits", "method", "h", "s", "cx", "depth"]
