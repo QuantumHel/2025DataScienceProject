@@ -25,6 +25,8 @@ from pauliopt.circuits import Circuit
 
 import matplotlib.pyplot as plt
 
+import copy
+
 # Suppress all overflow warnings globally
 np.seterr(over="ignore")
 
@@ -32,22 +34,180 @@ np.seterr(over="ignore")
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
+# Try a Block-Aware Residual Encoder (Expect to be better for Tableau Structure)
+class ResidualBlockAwareEncoder(nn.Module):
+    def __init__(self, n_qubits):
+        super().__init__()
+        self.n_qubits = n_qubits
+
+        # Extract features from X/Z blocks separately
+        self.x_block_encoder = nn.Sequential(
+            nn.Conv2d(2, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 48, 3, padding=1),
+        )
+
+        self.z_block_encoder = nn.Sequential(
+            nn.Conv2d(2, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 48, 3, padding=1),
+        )
+
+        # Combine X/Z information
+        self.combiner = nn.Conv2d(96, 64, 1)
+
+        # Final processing
+        self.final = nn.Sequential(
+            nn.GELU(),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((4, 4)),
+        )
+
+    def forward(self, x):
+        # Split X and Z blocks
+        n_qubits = self.n_qubits
+        x_part = x[:, :, :n_qubits, :]
+        z_part = x[:, :, n_qubits:, :]
+
+        # Process blocks separately
+        x_features = self.x_block_encoder(x_part)
+        z_features = self.z_block_encoder(z_part)
+
+        # Combine features
+        combined = torch.cat([x_features, z_features], dim=1)
+        combined = self.combiner(combined)
+
+        # Final processing
+        output = self.final(combined)
+        return output.flatten(start_dim=1)
+
+
+# Try a tableau-aware encoder
+class TableauStructureEncoder(nn.Module):
+    def __init__(self, n_qubits):
+        super().__init__()
+        self.n_qubits = n_qubits
+
+        # Single pathway with structural awareness
+        self.encoder = nn.Sequential(
+            # Initial feature extraction
+            nn.Conv2d(2, 32, 3, padding=1),
+            nn.GELU(),
+            nn.BatchNorm2d(32),
+            # Capture larger patterns
+            nn.Conv2d(32, 64, 5, padding=2),
+            nn.GELU(),
+            nn.BatchNorm2d(64),
+            # Global context
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.GELU(),
+            nn.BatchNorm2d(128),
+        )
+
+        # Position-aware readout
+        self.pool = nn.AdaptiveAvgPool2d((4, 4))
+
+        # Final projection
+        self.project = nn.Linear(128 * 4 * 4, 256)
+
+    def forward(self, x):
+        # Process the whole tableau together
+        features = self.encoder(x)
+        pooled = self.pool(features)
+        return self.project(pooled.flatten(1))
+
+
+class TransformerTableauEncoder(nn.Module):
+    def __init__(self, n_qubits, dim=256, num_layers=4, num_heads=8):
+        super().__init__()
+        self.n_qubits = n_qubits
+
+        # Embedding for tableau entries
+        self.embedding = nn.Linear(2, dim)  # 2 channels to dimension
+
+        # 2D positional encoding
+        self.row_pos = nn.Parameter(torch.randn(2 * n_qubits, dim // 2))
+        self.col_pos = nn.Parameter(torch.randn(2 * n_qubits, dim // 2))
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=num_heads,
+            dim_feedforward=dim * 4,
+            activation=F.gelu,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output projection
+        self.output_proj = nn.Linear(dim * (2 * n_qubits) ** 2, dim)
+
+    def forward(self, x):
+        B = x.size(0)
+        n = 2 * self.n_qubits
+
+        # Reshape input to [batch, n*n, 2]
+        x = x.permute(0, 2, 3, 1).reshape(B, n * n, 2)
+
+        # Embed features
+        x = self.embedding(x)  # [batch, n*n, dim]
+
+        # Add 2D positional encoding
+        pos_indices = torch.arange(n, device=x.device)
+        row_idx = pos_indices.repeat_interleave(n).view(n, n)
+        col_idx = pos_indices.repeat(n, 1)
+
+        row_emb = self.row_pos[row_idx.flatten()]  # [n*n, dim//2]
+        col_emb = self.col_pos[col_idx.flatten()]  # [n*n, dim//2]
+        pos_emb = torch.cat([row_emb, col_emb], dim=-1)  # [n*n, dim]
+
+        # Add positional embeddings
+        x = x + pos_emb.unsqueeze(0)  # [batch, n*n, dim]
+
+        # Pass through transformer
+        x = self.transformer(x)  # [batch, n*n, dim]
+
+        # Global pooling with attention
+        x = x.flatten(1)  # [batch, n*n*dim]
+        x = self.output_proj(x)  # [batch, dim]
+
+        return x
+
+
 class OrderedPermutationTransformer(nn.Module):
-    def __init__(self, n_qubits, dim=128, num_layers=4):
+    # def __init__(self, n_qubits, dim=128, num_layers=4):
+    def __init__(self, n_qubits, dim=256, num_layers=4, num_heads=8):
         super().__init__()
         self.n_qubits = n_qubits
         self.dim = dim
 
         # Tableau Encoder
-        self.tableau_encoder = nn.Sequential(
-            nn.Conv2d(2, 16, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.AdaptiveAvgPool2d((4, 4)),
+        # self.tableau_encoder = nn.Sequential(
+        #     nn.Conv2d(2, 16, 3, padding=1),
+        #     nn.GELU(),
+        #     nn.Conv2d(16, 32, 3, padding=1),
+        #     nn.AdaptiveAvgPool2d((4, 4)),
+        # )
+
+        # Try a Transformer-based encoder
+        self.tableau_encoder = TransformerTableauEncoder(
+            n_qubits=n_qubits, dim=dim, num_layers=num_layers, num_heads=num_heads
         )
 
+        # try a Residual Block-Aware Encoder
+        # Not as good as expected
+        # self.tableau_encoder = ResidualBlockAwareEncoder(n_qubits)
+        # self.tableau_encoder = TableauStructureEncoder(n_qubits)
+
         # Linear layer to match the dimension
-        self.linear = nn.Linear(32 * 4 * 4, dim)
+        # self.linear = nn.Linear(32 * 4 * 4, dim)
+        # No need for linear projection layer (the line above) - encoder already outputs dim-dimensional vectors
+        # As the TransformerTableauEncoder handles this internally
+
+        # try a Residual Block-Aware Encoder or Tableau Structure Encoder
+        # self.linear = nn.Linear(64 * 4 * 4, dim)
+        # self.linear = nn.Linear(256, dim)
 
         # Sequence Decoder
         self.decoder = nn.TransformerDecoder(
@@ -76,8 +236,9 @@ class OrderedPermutationTransformer(nn.Module):
         # Encode Tableau
         B = tableau.size(0)
         x = self.tableau_encoder(tableau)
-        x = x.view(B, -1)
-        x = self.linear(x)  # Ensure the dimension matches
+        # The two lines below are not needed for the Transformer-based encoder
+        # x = x.view(B, -1)
+        # x = self.linear(x)  # Ensure the dimension matches
 
         # Generate Sequence
         memory = x.unsqueeze(0)  # [1, batch_size, dim]
@@ -192,15 +353,15 @@ def train(model, dataloader, epochs=100, device=None):
         optimizer, max_lr=2e-4, total_steps=epochs * len(dataloader), pct_start=0.3
     )
     criterion = OrderedPermutationLoss()
-    sinkhorn = SequentialSinkhorn()
+    # sinkhorn = SequentialSinkhorn()
 
     # Gradient accumulation (for larger batches)
     accum_steps = 4
 
     loss_history = []  # To track loss per epoch
-    best_validation_score = float("inf")  # for tracking the best model
-    best_model_state = None
-    validation_scores = []
+    # best_validation_score = float("inf")  # for tracking the best model
+    # best_model_state = None
+    # validation_scores = []
 
     for epoch in range(epochs):
         model.train()
@@ -264,16 +425,22 @@ def train(model, dataloader, epochs=100, device=None):
         loss_history.append(avg_loss)
         print(f"Epoch {epoch+1} completed | Average Loss: {avg_loss:.4f}")
 
-        # Optional - plot every few epochs
-        if epoch % 5 == 0 or epoch == epochs - 1:
-            plt.figure(figsize=(10, 6))
-            plt.plot(range(1, len(loss_history) + 1), loss_history, marker="o")
-            plt.title("Training Loss by Epoch")
-            plt.xlabel("Epoch")
-            plt.ylabel("Loss")
-            plt.grid(True)
-            plt.savefig(f"loss_epoch_{epoch+1}.png")
-            plt.close()
+    # Plotting loss history
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(loss_history) + 1), loss_history, marker="o")
+    plt.title("Training Loss by Epoch")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    plt.savefig("loss_history.png")
+    plt.close()
+    # Save the model
+    torch.save(model.state_dict(), "ordered_permutation_model.pth")
+    print("Model saved as ordered_permutation_model.pth")
+    # Save loss history
+    with open("loss_history.pkl", "wb") as f:
+        pickle.dump(loss_history, f)
+    print("Loss history saved as loss_history.pkl")
 
     return model  # Return the trained model
 
@@ -474,13 +641,278 @@ def pretrain_a_model_from_file(data_file="training_data_perm.pkl", max_samples=N
         dataset,
         batch_size=32,
         shuffle=True,
-        collate_fn=custom_collate_fn,  # Add this line
+        collate_fn=custom_collate_fn,
     )
 
     # Auto-detect device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # train(model, dataloader, epochs=10, device=device)
-    train(model, dataloader, epochs=100, device=device)
+    train(
+        model, dataloader, epochs=30, device=device
+    )  # 100 epochs too much, plateau at 50; well, 50 epochs seem too much too
+    return model
+
+
+def convert_tensor_to_tableau(tableau_tensor):
+    """Convert tensor representation back to CliffordTableau object"""
+    # Extract tableau data from tensor
+    n_qubits = tableau_tensor.shape[-1] // 2
+
+    # Convert to int8 for proper bitwise operations (important fix!)
+    tableau_data = tableau_tensor[0, :, :].cpu().numpy().astype(np.int8)
+    signs_data = tableau_tensor[1, :, 0].cpu().numpy().astype(np.int8)
+
+    # Create a new tableau
+    tableau = CliffordTableau(n_qubits)
+    tableau.tableau = tableau_data
+    tableau.signs = signs_data
+
+    return tableau
+
+
+def rl_fine_tune(model, dataset, epochs=5, device="cpu"):
+    """Fine-tune permutation model with RL targeting CX reduction"""
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-6)
+    reward_history = []  # For reward normalization
+
+    for epoch in range(epochs):
+        total_reward = 0
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=1, shuffle=True, collate_fn=custom_collate_fn
+        )
+
+        for batch_idx, (tableau_tensors, _) in enumerate(dataloader):
+            # Get tableau and convert to proper format
+            tableau_tensor = tableau_tensors[0]
+            clifford_tableau = convert_tensor_to_tableau(tableau_tensor)
+            tableau_tensor = tableau_tensor.unsqueeze(0).to(device)
+
+            # BASELINE: Get CX count with normal heuristic
+            topology = Topology.complete(clifford_tableau.n_qubits)
+            baseline_circuit = synthesize_tableau_perm_row_col(
+                clifford_tableau, topology
+            )
+            baseline_cx = collect_circuit_data(baseline_circuit)["cx"]
+
+            # Get model prediction with gradient tracking
+            optimizer.zero_grad()
+            raw_preds, _ = model(tableau_tensor)
+            logits = raw_preds[0, 0]
+
+            # Apply Sinkhorn with gradient tracking
+            for _ in range(20):
+                logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+                logits = logits - torch.logsumexp(logits, dim=-2, keepdim=True)
+
+            # Sample permutation using Gumbel-Softmax
+            n_qubits = logits.shape[0]
+            gumbels = -torch.log(-torch.log(torch.rand_like(logits)))
+            gumbel_logits = (logits + gumbels) / 0.5  # Temperature
+            probs = F.softmax(gumbel_logits, dim=-1)
+
+            # Extract permutation using Hungarian algorithm
+            perm_matrix = probs.detach().cpu().numpy()
+            row_ind, col_ind = linear_sum_assignment(-perm_matrix)
+            perm = [(int(i), int(j)) for i, j in zip(row_ind, col_ind)]
+
+            # Track log probabilities for gradient flow
+            log_probs = []
+            for i, j in zip(row_ind, col_ind):
+                log_probs.append(torch.log(probs[i, j] + 1e-10))
+
+            # Evaluate CX count (detached from graph)
+            with torch.no_grad():
+                test_tableau = copy.deepcopy(clifford_tableau)
+                pred_iter = iter(perm)
+
+                def pred_callback(G, remaining, remaining_rows, choice_fn=min):
+                    try:
+                        row, col = next(pred_iter)
+                        if isinstance(row, torch.Tensor):
+                            row = row.item()
+                        if isinstance(col, torch.Tensor):
+                            col = col.item()
+
+                        # CRITICAL: Validate pivot exists in graph
+                        graph_nodes = set(G.nodes())
+                        if (
+                            row in remaining_rows
+                            and row in graph_nodes
+                            and col in graph_nodes
+                            and G.has_edge(row, col)
+                        ):
+                            return int(row), int(col)
+                        else:
+                            raise StopIteration
+
+                    except StopIteration:
+                        # Safe fallback using G
+                        valid_rows = [r for r in remaining_rows if r in G]
+                        if not valid_rows:
+                            row = min(remaining_rows)
+                            return row, row
+
+                        row = choice_fn(valid_rows)
+                        if G[row]:
+                            col = next(iter(G[row]))  # Guaranteed safe
+                        else:
+                            col = row
+                        return int(row), int(col)
+
+                circuit = synthesize_tableau_perm_row_col(
+                    test_tableau, topology, pick_pivot_callback=pred_callback
+                )
+                cx_count = collect_circuit_data(circuit)["cx"]
+
+            # Calculate reward with normalization
+            reward = baseline_cx - cx_count
+            reward_history.append(reward)
+
+            if len(reward_history) > 10:
+                mean_reward = sum(reward_history[-10:]) / 10
+                std_reward = max(1.0, np.std(reward_history[-10:]))
+                normalized_reward = (reward - mean_reward) / std_reward
+            else:
+                normalized_reward = reward
+
+            # REINFORCE loss
+            policy_loss = -sum(log_probs) * normalized_reward
+
+            # Backprop and update
+            policy_loss.backward()
+            optimizer.step()
+
+            total_reward += reward
+
+            if batch_idx % 10 == 0:
+                print(
+                    f"Epoch {epoch+1} | Batch {batch_idx} | Reward: {reward:.2f} | CX: {cx_count}"
+                )
+
+        print(f"Epoch {epoch+1} | Avg Reward: {total_reward/len(dataloader):.2f}")
+
+    return model
+
+
+def supervised_cx_fine_tune(model, dataset, epochs=5, device="cpu"):
+    """Fine-tune with supervised learning focusing on CX reduction"""
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+
+    for epoch in range(epochs):
+        total_improvement = 0
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=8, shuffle=True, collate_fn=custom_collate_fn
+        )
+
+        for batch_idx, (tableau_tensors, _) in enumerate(dataloader):
+            # For each tableau in batch
+            for tableau_tensor in tableau_tensors:
+                optimizer.zero_grad()
+                clifford_tableau = convert_tensor_to_tableau(tableau_tensor)
+                tableau_tensor = tableau_tensor.unsqueeze(0).to(device)
+
+                # Get baseline CX count
+                topology = Topology.complete(clifford_tableau.n_qubits)
+                baseline_circuit = synthesize_tableau_perm_row_col(
+                    clifford_tableau, topology
+                )
+                baseline_cx = collect_circuit_data(baseline_circuit)["cx"]
+
+                # Generate permutation candidates and find best one
+                with torch.no_grad():
+                    raw_preds, _ = model(tableau_tensor)
+                    target_perm = None
+                    best_cx = baseline_cx
+
+                    # Try different permutations
+                    for step_idx in range(min(3, raw_preds.shape[1])):
+                        logits = raw_preds[0, step_idx]
+                        for _ in range(20):
+                            logits = logits - torch.logsumexp(
+                                logits, dim=-1, keepdim=True
+                            )
+                            logits = logits - torch.logsumexp(
+                                logits, dim=-2, keepdim=True
+                            )
+
+                        perm_matrix = torch.exp(logits / 0.1).cpu().numpy()
+                        row_ind, col_ind = linear_sum_assignment(-perm_matrix)
+                        perm = [(int(i), int(j)) for i, j in zip(row_ind, col_ind)]
+                        pred_iter = iter(perm)
+
+                        def pred_callback(G, remaining, remaining_rows, choice_fn=min):
+                            try:
+                                row, col = next(pred_iter)
+                                # Convert to int if they're tensors
+                                if isinstance(row, torch.Tensor):
+                                    row = row.item()
+                                if isinstance(col, torch.Tensor):
+                                    col = col.item()
+                                return int(row), int(col)  # Ensure integers
+                            # except StopIteration:
+                            #     row = choice_fn(remaining_rows)
+                            #     return row, row
+
+                            # Try smarter fallback, also no big improvement as expected
+                            except StopIteration:
+                                # Use graph analysis for better pivot selection
+                                row = choice_fn(remaining_rows)
+
+                                if G[row]:
+                                    # Choose column with highest impact
+                                    impact_scores = {}
+                                    for col in G[row]:
+                                        # Count affected rows
+                                        impact = sum(
+                                            1 for r in remaining_rows if col in G[r]
+                                        )
+                                        impact_scores[col] = impact
+
+                                    col = max(
+                                        impact_scores.items(), key=lambda x: x[1]
+                                    )[0]
+                                else:
+                                    col = row
+
+                                return int(row), int(col)
+
+                        circuit = synthesize_tableau_perm_row_col(
+                            clifford_tableau,
+                            topology,
+                            pick_pivot_callback=pred_callback,
+                        )
+                        cx_count = collect_circuit_data(circuit)["cx"]
+                        if cx_count < best_cx:
+                            best_cx = cx_count
+                            target_perm = perm
+
+                # If we found a better permutation, train toward it
+                if target_perm is not None and best_cx < baseline_cx:
+                    # Create target matrix
+                    target = torch.zeros_like(raw_preds[0, 0])
+                    for i, j in target_perm:
+                        target[i, j] = 1.0
+
+                    # Train model to predict this permutation
+                    new_preds, _ = model(tableau_tensor)
+                    logits = new_preds[0, 0]
+                    loss = F.mse_loss(torch.softmax(logits, dim=-1), target)
+                    loss.backward()
+                    optimizer.step()
+
+                    total_improvement += baseline_cx - best_cx
+
+            if batch_idx % 10 == 0:
+                print(
+                    f"Epoch {epoch+1} | Batch {batch_idx} | Improvement: {total_improvement/(batch_idx+1):.2f}"
+                )
+
+        print(
+            f"Epoch {epoch+1} | Avg CX Improvement: {total_improvement/len(dataloader):.2f}"
+        )
+
     return model
 
 
@@ -596,6 +1028,36 @@ def collect_circuit_data(circuit: Circuit) -> dict:
     }
 
 
+def compute_weighted_score(pred_metrics):
+    """
+    Computes a weighted score based on the number of CX gates and circuit depth.
+    The weights can be adjusted based on the importance of each metric.
+    """
+    # Define weights for each metric
+    cx_weight = 10.0  # Try adjusting from 10 to 50; 50 not good either
+    depth_weight = 1.0
+    # Compute weighted score, only keep cx seems worse
+    score = cx_weight * pred_metrics["cx"] + depth_weight * pred_metrics["depth"]
+    # score = pred_metrics["cx"]
+    return score
+
+
+def compute_adaptive_score(pred_metrics, baseline_metrics):
+    """Adapt weights based on how close we are to optimum"""
+    cx_ratio = pred_metrics["cx"] / baseline_metrics["cx"]
+    depth_ratio = pred_metrics["depth"] / baseline_metrics["depth"]
+
+    # If CX is much worse than depth, focus more on CX
+    if cx_ratio > depth_ratio * 1.2:
+        cx_weight = 20.0
+        depth_weight = 0.5
+    else:
+        cx_weight = 10.0
+        depth_weight = 1.0
+
+    return cx_weight * pred_metrics["cx"] + depth_weight * pred_metrics["depth"]
+
+
 def predict_permutation(model, clifford_tableau, device="cpu"):
     """Returns the best permutation after evaluating multiple candidates"""
     device = torch.device(device)
@@ -608,52 +1070,77 @@ def predict_permutation(model, clifford_tableau, device="cpu"):
     # Store best permutation and its score
     best_perm = None
     best_score = float("inf")
+    topology = Topology.complete(clifford_tableau.n_qubits)
 
     with torch.no_grad():
         # Get predictions for all steps
-        raw_preds, stop_logits = model(tableau_tensor)
+        raw_preds, _ = model(tableau_tensor)
 
         # Try the top 3 steps and keep the best one
-        for step_idx in range(min(3, raw_preds.shape[1])):
+        for step_idx in range(min(8, raw_preds.shape[1])):  # try 5 instead of 3
             # Apply Sinkhorn normalization
             logits = raw_preds[0, step_idx]
             for _ in range(20):
                 logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
                 logits = logits - torch.logsumexp(logits, dim=-2, keepdim=True)
-            perm_matrix = torch.exp(logits / 0.1).cpu().numpy()
 
-            # Extract permutation using Hungarian algorithm
-            row_ind, col_ind = linear_sum_assignment(-perm_matrix)
-            perm = [(int(i), int(j)) for i, j in zip(row_ind, col_ind)]
+            # Try different temperatures, no big improvement as expected
+            for temp in [0.01, 0.02, 0.05, 0.1, 0.2, 0.5]:
+                # perm_matrix = torch.exp(logits / 0.1).cpu().numpy()
+                perm_matrix = torch.exp(logits / temp).cpu().numpy()  # Temperatures
 
-            pred_iter = iter(perm)
+                # Extract permutation using Hungarian algorithm
+                row_ind, col_ind = linear_sum_assignment(-perm_matrix)
+                perm = [(int(i), int(j)) for i, j in zip(row_ind, col_ind)]
 
-            def pred_callback(G, remaining, remaining_rows, choice_fn=min):
-                try:
-                    row, col = next(pred_iter)
-                    # Convert to int if they're tensors
-                    if isinstance(row, torch.Tensor):
-                        row = row.item()
-                    if isinstance(col, torch.Tensor):
-                        col = col.item()
-                    return int(row), int(col)  # Ensure integers
-                except StopIteration:
-                    row = choice_fn(remaining_rows)
-                    return row, row
+                pred_iter = iter(perm)
 
-            topology = Topology.complete(clifford_tableau.n_qubits)
-            pred_circuit = synthesize_tableau_perm_row_col(
-                clifford_tableau, topology, pick_pivot_callback=pred_callback
-            )
-            pred_metrics = collect_circuit_data(pred_circuit)
+                def pred_callback(G, remaining, remaining_rows, choice_fn=min):
+                    try:
+                        row, col = next(pred_iter)
+                        # Convert to int if they're tensors
+                        if isinstance(row, torch.Tensor):
+                            row = row.item()
+                        if isinstance(col, torch.Tensor):
+                            col = col.item()
+                        return int(row), int(col)  # Ensure integers
+                    # except StopIteration:
+                    #     row = choice_fn(remaining_rows)
+                    #     return row, row
 
-            # Synthesize circuit and count gates
-            score = pred_metrics["cx"] + pred_metrics["depth"]
+                    # Try smarter fallback, also no big improvement as expected
+                    except StopIteration:
+                        # Use graph analysis for better pivot selection
+                        row = choice_fn(remaining_rows)
 
-            # Keep track of best permutation
-            if score < best_score:
-                best_score = score
-                best_perm = perm
+                        if G[row]:
+                            # Choose column with highest impact
+                            impact_scores = {}
+                            for col in G[row]:
+                                # Count affected rows
+                                impact = sum(1 for r in remaining_rows if col in G[r])
+                                impact_scores[col] = impact
+
+                            col = max(impact_scores.items(), key=lambda x: x[1])[0]
+                        else:
+                            col = row
+
+                        return int(row), int(col)
+
+                pred_circuit = synthesize_tableau_perm_row_col(
+                    clifford_tableau, topology, pick_pivot_callback=pred_callback
+                )
+                pred_metrics = collect_circuit_data(pred_circuit)
+
+                # Synthesize circuit and count gates
+                # score = pred_metrics["cx"] + pred_metrics["depth"] # Works fine already
+                score = compute_weighted_score(pred_metrics)
+                # score = compute_adaptive_score(pred_metrics, collect_circuit_data(circuit))
+
+                # Keep track of best permutation
+                if score < best_score:
+                    best_score = score
+                    best_perm = perm
 
     # # Fall back to first permutation if nothing improved the score
     # if best_perm is None:
@@ -670,7 +1157,21 @@ def predict_permutation(model, clifford_tableau, device="cpu"):
 
 # # Example of usage:
 # model = pretrain_a_model_from_file("training_data_perm.pkl", max_samples=320)
+# # Try RL fine-tuning
+# # rl_dataset = TableauPermutationDataset(
+# #     data_file="training_data_perm_4_qubit.pkl", n_qubits=4, max_samples=320
+# # )
+# # rl_model = rl_fine_tune(
+# #     model, rl_dataset, epochs=5, device="cuda" if torch.cuda.is_available() else "cpu"
+# # )
+# sl_dataset = TableauPermutationDataset(
+#     data_file="training_data_perm_4_qubit.pkl", n_qubits=4, max_samples=320
+# )
+# sl_model = supervised_cx_fine_tune(
+#     model, sl_dataset, epochs=5, device="cuda" if torch.cuda.is_available() else "cpu"
+# )
 # circuit = random_hscx_circuit(nr_qubits=4, nr_gates=1000)
 # tableau = tableau_from_circuit(CliffordTableau(4), circuit)
-# permutations = predict_permutation(model, tableau)
+# # permutations = predict_permutation(model, tableau)
+# permutations = predict_permutation(sl_model, tableau)
 # print(permutations)

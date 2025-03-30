@@ -14,13 +14,10 @@ np.seterr(over="ignore")
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
-def generate_data():
+def generate_data(n_qubits=4, nr_gates=1000, batch_size=32, num_epochs=100):
     # Configuration
-    n_qubits = 4  # Specify the number of qubits (e.g., 4)
-    batch_size = 32
-    num_epochs = 100
     total_data_points = batch_size * num_epochs  # 3200
-    filename = "training_data_perm.pkl"
+    filename = f"training_data_perm_{n_qubits}_qubit.pkl"
 
     # Generate and save data
     data = []
@@ -29,7 +26,7 @@ def generate_data():
     with tqdm(total=total_data_points, desc="Generating data", unit="circuits") as pbar:
         for i in range(total_data_points):
             # Generate circuit with minimum gates
-            circuit = random_hscx_circuit(nr_qubits=n_qubits, nr_gates=1000)
+            circuit = random_hscx_circuit(nr_qubits=n_qubits, nr_gates=nr_gates)
             tableau = tableau_from_circuit(CliffordTableau(n_qubits), circuit)
             best_perms = get_best_cnots(tableau, Topology.complete(n_qubits))
 
@@ -53,7 +50,7 @@ def generate_data():
 
 
 def main():
-    generate_data()
+    generate_data(n_qubits=5, nr_gates=1000, batch_size=32, num_epochs=100)
     return 0
 
 

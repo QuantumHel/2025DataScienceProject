@@ -33,6 +33,8 @@ from src.nn.permutation_math import (
     predict_permutation,
     pretrain_a_model_from_file,
     OrderedPermutationTransformer,
+    TableauPermutationDataset,
+    supervised_cx_fine_tune,
 )
 
 # Suppress all overflow warnings globally
@@ -165,6 +167,10 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
 
     # Pre-train a model
     model = pretrain_a_model_from_file("nn/training_data_perm.pkl", max_samples=None)
+    sl_dataset = TableauPermutationDataset(
+        "nn/training_data_perm_4_qubit.pkl", n_qubits=4, max_samples=960
+    )
+    sl_model = supervised_cx_fine_tune(model, sl_dataset, epochs=30, device="cpu")
 
     df = pd.DataFrame(
         columns=["n_rep", "num_qubits", "method", "h", "s", "cx", "depth"]
@@ -195,7 +201,7 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
 
         # Dummy_perm compilation
         df_dictionary = pd.DataFrame(
-            [dummy_perm_compilation(circuit.copy(), topo, i, model)]
+            [dummy_perm_compilation(circuit.copy(), topo, i, sl_model)]
         )
         df = pd.concat([df, df_dictionary], ignore_index=True)
         print("Dummy-perm", df_dictionary["cx"])
