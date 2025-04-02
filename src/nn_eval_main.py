@@ -35,6 +35,7 @@ from src.nn.permutation_math import (
     OrderedPermutationTransformer,
     TableauPermutationDataset,
     supervised_cx_fine_tune,
+    predict_permutation_gumbel,
 )
 
 # Suppress all overflow warnings globally
@@ -142,7 +143,7 @@ def dummy_perm_compilation(
 ):
     clifford_tableau = CliffordTableau(circuit.n_qubits)
     clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
-    best_permutation = predict_permutation(model, clifford_tableau)
+    best_permutation = predict_permutation_gumbel(model, clifford_tableau)
     best_permutation = iter(best_permutation[0])
 
     def pick_pivot_callback(
@@ -166,17 +167,19 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
     """
 
     # Pre-train a model
-    model = pretrain_a_model_from_file("nn/training_data_perm.pkl", max_samples=None)
-    sl_dataset = TableauPermutationDataset(
-        "nn/training_data_perm_4_qubit.pkl", n_qubits=4, max_samples=960
+    model = pretrain_a_model_from_file(
+        "nn/training_data_perm.pkl", max_samples=None, epochs=50
     )
-    sl_model = supervised_cx_fine_tune(model, sl_dataset, epochs=30, device="cpu")
+    # sl_dataset = TableauPermutationDataset(
+    #     "nn/training_data_perm_4_qubit.pkl", n_qubits=4, max_samples=320
+    # )
+    # sl_model = supervised_cx_fine_tune(model, sl_dataset, epochs=50, device="cpu")
 
     df = pd.DataFrame(
         columns=["n_rep", "num_qubits", "method", "h", "s", "cx", "depth"]
     )
     topo = Topology.complete(n_qubits)
-    for i in range(50):
+    for i in range(1000):
         circuit = random_hscx_circuit(nr_qubits=n_qubits, nr_gates=nr_gates)
 
         # Our compilation e.g. the baseline from the paper
@@ -201,8 +204,11 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
 
         # Dummy_perm compilation
         df_dictionary = pd.DataFrame(
-            [dummy_perm_compilation(circuit.copy(), topo, i, sl_model)]
+            [dummy_perm_compilation(circuit.copy(), topo, i, model)]
         )
+        # df_dictionary = pd.DataFrame(
+        #     [dummy_perm_compilation(circuit.copy(), topo, i, sl_model)]
+        # ) # Uncomment this line to use the model with SL fine-tuning
         df = pd.concat([df, df_dictionary], ignore_index=True)
         print("Dummy-perm", df_dictionary["cx"])
 
