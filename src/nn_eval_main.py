@@ -36,6 +36,8 @@ from src.nn.permutation_math import (
     TableauPermutationDataset,
     supervised_cx_fine_tune,
     predict_permutation_gumbel,
+    predict_permutation_beam,
+    entropy_guided_search,
 )
 
 # Suppress all overflow warnings globally
@@ -143,7 +145,9 @@ def dummy_perm_compilation(
 ):
     clifford_tableau = CliffordTableau(circuit.n_qubits)
     clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
-    best_permutation = predict_permutation_gumbel(model, clifford_tableau)
+    # best_permutation = predict_permutation_gumbel(model, clifford_tableau)
+    # best_permutation = predict_permutation_beam(model, clifford_tableau)
+    best_permutation = entropy_guided_search(model, clifford_tableau)
     best_permutation = iter(best_permutation[0])
 
     def pick_pivot_callback(

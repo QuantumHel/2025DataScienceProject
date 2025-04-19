@@ -176,6 +176,78 @@ class TransformerTableauEncoder(nn.Module):
         return x
 
 
+# Try a self-attention block
+class SelfAttentionBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.query = nn.Conv2d(channels, channels // 8, 1)
+        self.key = nn.Conv2d(channels, channels // 8, 1)
+        self.value = nn.Conv2d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        batch, c, h, w = x.size()
+        query = self.query(x).view(batch, -1, h * w).permute(0, 2, 1)
+        key = self.key(x).view(batch, -1, h * w)
+        energy = torch.bmm(query, key)
+        attention = F.softmax(energy, dim=-1)
+        value = self.value(x).view(batch, -1, h * w)
+        out = torch.bmm(value, attention.permute(0, 2, 1))
+        out = out.view(batch, c, h, w)
+        return x + self.gamma * out
+
+
+# Try a CX-aware decoder
+class PermutationCXAwareDecoder(nn.Module):
+    def __init__(self, dim, n_qubits, num_layers=4, nhead=4):
+        super().__init__()
+        # Base transformer decoder
+        self.decoder = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(
+                d_model=dim, nhead=nhead, dim_feedforward=4 * dim, activation=F.gelu
+            ),
+            num_layers=num_layers,
+        )
+
+        # CX-aware attention mechanism
+        self.cx_attention = nn.Linear(dim, n_qubits**2)
+
+        # Direct CX estimation per permutation element
+        self.element_cx_impact = nn.Parameter(torch.zeros(n_qubits, n_qubits))
+
+        # Final CX integration layer
+        self.cx_integration = nn.Sequential(
+            nn.Linear(dim + n_qubits**2, dim), nn.GELU(), nn.LayerNorm(dim)
+        )
+
+    def forward(self, tgt, memory):
+        # Regular transformer decoding
+        output = self.decoder(tgt, memory)
+
+        # Generate CX-aware attention weights
+        cx_weights = torch.sigmoid(self.cx_attention(output))
+
+        # Reshape for visualization and further processing
+        batch_size = output.size(1)
+        seq_len = output.size(0)
+        cx_weights = cx_weights.view(seq_len, batch_size, -1)
+
+        # Mix output with CX awareness
+        enhanced_output = self.cx_integration(torch.cat([output, cx_weights], dim=-1))
+
+        return enhanced_output, cx_weights
+
+
+# Residual block for CX predictions
+class ResidualCXBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.LayerNorm(dim))
+
+    def forward(self, x):
+        return x + self.net(x)  # Residual connection
+
+
 class OrderedPermutationTransformer(nn.Module):
     # def __init__(self, n_qubits, dim=128, num_layers=4):
     def __init__(self, n_qubits, dim=256, num_layers=4, num_heads=8):
@@ -191,15 +263,30 @@ class OrderedPermutationTransformer(nn.Module):
         #     nn.AdaptiveAvgPool2d((4, 4)),
         # )
 
-        # Try enhanced CNN encoder
+        # # Try enhanced CNN encoder, works better!
+        # self.tableau_encoder = nn.Sequential(
+        #     nn.Conv2d(2, 32, 3, padding=1),
+        #     nn.GELU(),
+        #     nn.BatchNorm2d(32),  # Added normalization
+        #     nn.Conv2d(32, 64, 3, padding=1),
+        #     nn.GELU(),
+        #     nn.BatchNorm2d(64),  # Added normalization
+        #     nn.Conv2d(64, 64, 3, padding=1),  # Added third layer
+        #     nn.GELU(),
+        #     nn.AdaptiveAvgPool2d((4, 4)),
+        # )
+
+        # Try even further with self-attention, results?
         self.tableau_encoder = nn.Sequential(
             nn.Conv2d(2, 32, 3, padding=1),
             nn.GELU(),
-            nn.BatchNorm2d(32),  # Added normalization
+            nn.BatchNorm2d(32),
+            SelfAttentionBlock(32),  # Add self-attention between conv layers
             nn.Conv2d(32, 64, 3, padding=1),
             nn.GELU(),
-            nn.BatchNorm2d(64),  # Added normalization
-            nn.Conv2d(64, 64, 3, padding=1),  # Added third layer
+            nn.BatchNorm2d(64),
+            SelfAttentionBlock(64),  # Add self-attention between conv layers
+            nn.Conv2d(64, 64, 3, padding=1),
             nn.GELU(),
             nn.AdaptiveAvgPool2d((4, 4)),
         )
@@ -226,12 +313,17 @@ class OrderedPermutationTransformer(nn.Module):
         # self.linear = nn.Linear(64 * 4 * 4, dim)
         # self.linear = nn.Linear(256, dim)
 
-        # Sequence Decoder
-        self.decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(
-                d_model=dim, nhead=4, dim_feedforward=4 * dim, activation=F.gelu
-            ),
-            num_layers=num_layers,
+        # # Sequence Decoder, works well
+        # self.decoder = nn.TransformerDecoder(
+        #     nn.TransformerDecoderLayer(
+        #         d_model=dim, nhead=4, dim_feedforward=4 * dim, activation=F.gelu
+        #     ),
+        #     num_layers=num_layers,
+        # )
+
+        # Try a CX-aware decoder, results?
+        self.decoder = PermutationCXAwareDecoder(
+            dim=dim, n_qubits=n_qubits, num_layers=num_layers, nhead=4
         )
 
         # Position-Aware Prediction Heads
@@ -249,13 +341,54 @@ class OrderedPermutationTransformer(nn.Module):
         # Adaptive Sequence Length Prediction
         self.stop_head = nn.Linear(dim, 1)
 
-        # Add CX Prediction Head
+        # # Add CX Prediction Head, works well
+        # self.cx_head = nn.Sequential(
+        #     nn.Linear(dim, dim // 2),
+        #     nn.GELU(),
+        #     nn.Dropout(0.1),
+        #     nn.Linear(dim // 2, 1),
+        #     nn.ReLU(),  # Ensure non-negative predictions
+        # )
+
+        # # Try making CX head more sophisticated and directly connected to permutation prediction
+        # self.cx_head = nn.Sequential(
+        #     nn.Linear(dim + n_qubits**2, 256),  # Add permutation matrix features
+        #     nn.GELU(),
+        #     nn.Dropout(0.1),
+        #     nn.LayerNorm(256),
+        #     nn.Linear(256, 128),
+        #     nn.GELU(),
+        #     nn.Linear(128, 1),
+        #     nn.Softplus(),  # Ensure non-negative predictions
+        # )
+
+        # # Try a more sophisticated CX head to accept the additional cx_aware features
+        # self.cx_head = nn.Sequential(
+        #     nn.Linear(
+        #         dim + n_qubits**2 + n_qubits**2, 256
+        #     ),  # Added cx_awareness features
+        #     nn.GELU(),
+        #     nn.Dropout(0.1),
+        #     nn.LayerNorm(256),
+        #     nn.Linear(256, 128),
+        #     nn.GELU(),
+        #     nn.Linear(128, 1),
+        #     nn.Softplus(),  # Ensure non-negative predictions
+        # )
+
+        # Enhanced CX-head with residual connections
         self.cx_head = nn.Sequential(
-            nn.Linear(dim, dim // 2),
+            nn.Linear(dim + n_qubits**2 + n_qubits**2, 384),  # Wider network
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim // 2, 1),
-            nn.ReLU(),  # Ensure non-negative predictions
+            nn.Dropout(0.15),  # Slightly higher dropout
+            nn.LayerNorm(384),
+            ResidualCXBlock(384),  # Add residual connections
+            nn.Linear(384, 128),
+            nn.GELU(),
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+            nn.ReLU(),  # Use ReLU instead of Softplus for sharper predictions
         )
 
     def forward(self, tableau):
@@ -275,8 +408,14 @@ class OrderedPermutationTransformer(nn.Module):
         cx_predicitons = []  # For CX-prediction
 
         for t in range(10):  # Max steps
-            # Transformer Decoder
-            output = self.decoder(tgt=output.unsqueeze(0), memory=memory).squeeze(0)
+            # # Transformer Decoder
+            # output = self.decoder(tgt=output.unsqueeze(0), memory=memory).squeeze(0)
+
+            # Try CX-aware decoder
+            output_enhanced, cx_awareness = self.decoder(
+                tgt=output.unsqueeze(0), memory=memory
+            )
+            output = output_enhanced.squeeze(0)
 
             # Step-Specific Prediction
             pred = self.step_heads[t](output)  # [batch_size, n_qubits*n_qubits]
@@ -288,7 +427,18 @@ class OrderedPermutationTransformer(nn.Module):
             stop_logits.append(self.stop_head(output))
 
             # For CX-prediction
-            cx_pred = self.cx_head(output)
+            # cx_pred = self.cx_head(output) # This line is replaced by the two lines below for sophisticated CX prediction
+            perm_features = pred.view(B, self.n_qubits, self.n_qubits).flatten(1)
+            # cx_pred = self.cx_head(torch.cat([output, perm_features], dim=1))
+            # cx_predicitons.append(cx_pred)
+
+            # Try mixing with cx_awareness information from decoder
+            cx_aware_features = torch.cat(
+                [output, perm_features, cx_awareness.squeeze(0)], dim=1
+            )
+
+            # Updated CX head to use awareness features
+            cx_pred = self.cx_head(cx_aware_features)
             cx_predicitons.append(cx_pred)
 
         # Stack along sequence dimension -> [batch_size, seq_len, n_qubits, n_qubits]
@@ -297,8 +447,14 @@ class OrderedPermutationTransformer(nn.Module):
         # Stack stop logits -> [batch_size, seq_len]
         stop_logits = torch.cat(stop_logits, dim=1)
 
-        # For CX-prediction
-        cx_predicitons = torch.cat(cx_predicitons, dim=1)  # [batch_size, seq_len]
+        # # For CX-prediction
+        # cx_predicitons = torch.cat(cx_predicitons, dim=1)  # [batch_size, seq_len]
+
+        # Try sofisticated CX prediction
+        # For CX prediction, use both tableau features and permutation info
+        # perm_features = predictions[0].flatten(1)  # Use permutation matrix features
+        # cx_predicitons = self.cx_head(torch.cat([output, perm_features], dim=1))
+        cx_predicitons = torch.cat(cx_predicitons, dim=1)
 
         return predictions, stop_logits, cx_predicitons
 
@@ -1470,11 +1626,264 @@ def predict_permutation_gumbel(model, clifford_tableau, device="cpu"):
     return [best_perm]  # Keep list format for compatibility
 
 
+# Try beam search based on the predict_permutation_gumbel function
+# Still in development, not ready to use, contains some bugs
+def predict_permutation_beam(model, clifford_tableau, device="cpu", beam_width=5):
+    """Uses beam search to find the best permutation"""
+    device = torch.device(device)
+    model = model.to(device)
+
+    tableau_tensor = tableau_to_tensor(clifford_tableau)
+    tableau_tensor = tableau_tensor.unsqueeze(0).to(device)
+    n_qubits = clifford_tableau.n_qubits
+    topology = Topology.complete(n_qubits)
+
+    with torch.no_grad():
+        raw_preds, _, cx_preds = model(tableau_tensor)
+
+        # Initialize beam with empty permutation
+        beam = [([], 0)]  # (partial_perm, score)
+
+        # For each position in permutation
+        for step in range(n_qubits):
+            candidates = []
+
+            # For each partial permutation in beam
+            for partial_perm, score in beam:
+                # Weight step selection by predicted CX
+                cx_weights = torch.exp(-cx_preds[0] * 2)
+                step_probs = F.softmax(cx_weights, dim=0)
+                step_indices = torch.multinomial(
+                    step_probs, min(3, raw_preds.shape[1]), replacement=False
+                )
+
+                # Try different model-predicted steps
+                for step_idx in step_indices:
+                    logits = raw_preds[0, step_idx]
+
+                    # Sample with Gumbel-Sinkhorn at different temperatures
+                    for temp in [0.05, 0.1, 0.2]:
+                        perm_samples = gumbel_sinkhorn(logits, temp=temp, n_samples=3)
+
+                        for sample_matrix in perm_samples:
+                            perm_matrix = sample_matrix.cpu().numpy()
+                            row_ind, col_ind = linear_sum_assignment(-perm_matrix)
+                            full_perm = [
+                                (int(i), int(j)) for i, j in zip(row_ind, col_ind)
+                            ]
+
+                            # Get next mapping for this step
+                            if step < len(full_perm):
+                                next_elem = full_perm[step]
+
+                                # Create new candidate permutation
+                                new_perm = partial_perm + [next_elem]
+
+                                # Skip if invalid or incomplete
+                                if len(new_perm) <= step:
+                                    continue
+
+                                # Evaluate with synthesis
+                                pred_iter = iter(new_perm)
+
+                                def pred_callback(
+                                    G, remaining, remaining_rows, choice_fn=min
+                                ):
+                                    try:
+                                        row, col = next(pred_iter)
+                                        if isinstance(row, torch.Tensor):
+                                            row = row.item()
+                                        if isinstance(col, torch.Tensor):
+                                            col = col.item()
+
+                                        # Check if this pivot is valid in the tableau
+                                        if (
+                                            hasattr(remaining, "_x_out")
+                                            and remaining._x_out(int(row), int(col))
+                                            == 1
+                                        ):
+                                            return int(row), int(col)
+                                        else:
+                                            # If not valid, fall back to the default approach
+                                            raise StopIteration
+
+                                    except StopIteration:
+                                        # SAFE FALLBACK: Scan the entire tableau for ANY valid pivot
+                                        # This is guaranteed to find a pivot if the tableau is valid
+                                        for r in remaining_rows:
+                                            for c in range(remaining.n_qubits * 2):
+                                                if remaining._x_out(r, c) == 1:
+                                                    return int(r), int(c)
+
+                                        # Last resort: If somehow we got here (shouldn't happen with valid tableaus)
+                                        # Just return the first remaining row with itself as column
+                                        if remaining_rows:
+                                            row = min(remaining_rows)
+                                            return int(row), int(row)
+                                        else:
+                                            # Absolute last resort - should never reach here with valid inputs
+                                            return 0, 0
+
+                                circuit = synthesize_tableau_perm_row_col(
+                                    clifford_tableau,
+                                    topology,
+                                    pick_pivot_callback=pred_callback,
+                                )
+                                metrics = collect_circuit_data(circuit)
+                                new_score = compute_weighted_score(metrics)
+                                candidates.append((new_perm, new_score))
+
+            # Keep top-k candidates for next step
+            beam = sorted(candidates, key=lambda x: x[1])[:beam_width]
+
+        # Get best permutation from final beam
+        if beam:
+            best_perm = beam[0][0]
+            # # Apply local refinement to the best permutation (too computationally expensive)
+            # best_perm = local_search_refine(clifford_tableau, best_perm, topology)
+            return [best_perm]
+        else:
+            # Fallback to identity permutation
+            return [[(i, i) for i in range(n_qubits)]]
+
+
+def entropy_guided_search(model, clifford_tableau, device="cpu", n_samples=5):
+    """Focus search on areas where model is uncertain to find better permutations"""
+    device = torch.device(device)
+    model = model.to(device)
+
+    tableau_tensor = tableau_to_tensor(clifford_tableau)
+    tableau_tensor = tableau_tensor.unsqueeze(0).to(device)
+    topology = Topology.complete(clifford_tableau.n_qubits)
+
+    with torch.no_grad():
+        # Forward pass to get raw predictions
+        raw_preds, _, cx_preds = model(tableau_tensor)
+
+        # Calculate entropy for each position (high entropy = uncertainty)
+        entropies = []
+        for step in range(raw_preds.shape[1]):
+            logits = raw_preds[0, step]
+
+            # Apply Sinkhorn normalization
+            for _ in range(20):
+                logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+                logits = logits - torch.logsumexp(logits, dim=-2, keepdim=True)
+
+            # Convert to probabilities
+            probs = torch.exp(logits)
+
+            # Calculate entropy: -sum(p * log(p))
+            entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+            entropies.append((step, entropy.item()))
+
+        # Sort steps by uncertainty (highest entropy first)
+        uncertain_steps = sorted(entropies, key=lambda x: -x[1])
+        # print(f"Step entropies: {[f'{i}:{e:.2f}' for i, e in uncertain_steps[:3]]}")
+
+        # Store best permutation and score
+        best_perm = None
+        best_score = float("inf")
+        best_metrics = None
+
+        # Explore uncertain steps more thoroughly
+        for step_idx, entropy in uncertain_steps[:3]:  # Focus on top-3 most uncertain
+            # Use adaptive temperature range - more temps for higher entropy
+            temps = [0.01, 0.03, 0.05, 0.1, 0.2, 0.5]
+            if entropy > 3.0:  # Very uncertain
+                temps.extend([0.7, 1.0])  # Add higher temps for exploration
+
+            # Sample more permutations for high-entropy areas
+            samples_for_step = n_samples + int(3 * entropy)
+
+            # print(f"Step {step_idx}: entropy={entropy:.2f}, samples={samples_for_step}")
+
+            for temp in temps:
+                # Generate multiple samples with Gumbel-Sinkhorn
+                perm_samples = gumbel_sinkhorn(
+                    raw_preds[0, step_idx], temp=temp, n_samples=samples_for_step
+                )
+
+                for sample_matrix in perm_samples:
+                    perm_matrix = sample_matrix.cpu().numpy()
+                    row_ind, col_ind = linear_sum_assignment(-perm_matrix)
+                    perm = [(int(i), int(j)) for i, j in zip(row_ind, col_ind)]
+
+                    # Evaluate permutation
+                    pred_iter = iter(perm)
+
+                    def pred_callback(G, remaining, remaining_rows, choice_fn=min):
+                        try:
+                            row, col = next(pred_iter)
+                            # Convert to int if they're tensors
+                            if isinstance(row, torch.Tensor):
+                                row = row.item()
+                            if isinstance(col, torch.Tensor):
+                                col = col.item()
+                            return int(row), int(col)  # Ensure integers
+                        # except StopIteration:
+                        #     row = choice_fn(remaining_rows)
+                        #     return row, row
+
+                        # Try smarter fallback, also no big improvement as expected
+                        except StopIteration:
+                            # Use graph analysis for better pivot selection
+                            row = choice_fn(remaining_rows)
+
+                            if G[row]:
+                                # Choose column with highest impact
+                                impact_scores = {}
+                                for col in G[row]:
+                                    # Count affected rows
+                                    impact = sum(
+                                        1 for r in remaining_rows if col in G[r]
+                                    )
+                                    impact_scores[col] = impact
+
+                                col = max(impact_scores.items(), key=lambda x: x[1])[0]
+                            else:
+                                col = row
+
+                            return int(row), int(col)
+
+                    circuit = synthesize_tableau_perm_row_col(
+                        clifford_tableau, topology, pick_pivot_callback=pred_callback
+                    )
+                    metrics = collect_circuit_data(circuit)
+                    score = compute_weighted_score(metrics)
+
+                    # Update best if improved
+                    if score < best_score:
+                        best_score = score
+                        best_perm = perm
+                        best_metrics = metrics
+                        # print(
+                        #     f"Found better: CX={metrics['cx']}, Depth={metrics['depth']}"
+                        # )
+
+        # In case nothing improved, fall back to basic prediction
+        if best_perm is None:
+            # Use basic Gumbel-Sinkhorn with default temp
+            perm_samples = gumbel_sinkhorn(raw_preds[0, 0], temp=0.1, n_samples=1)
+            perm_matrix = perm_samples[0].cpu().numpy()
+            row_ind, col_ind = linear_sum_assignment(-perm_matrix)
+            best_perm = [(int(i), int(j)) for i, j in zip(row_ind, col_ind)]
+
+        # if best_metrics:
+        #     print(
+        #         f"Best permutation: CX={best_metrics['cx']}, Depth={best_metrics['depth']}"
+        #     )
+
+        return [best_perm]  # Keep list format for compatibility
+
+
 # # Example 1 of usage (without fine-tuning):
 # model = pretrain_a_model_from_file("training_data_perm.pkl", max_samples=320, epochs=20)
 # circuit = random_hscx_circuit(nr_qubits=4, nr_gates=1000)
 # tableau = tableau_from_circuit(CliffordTableau(4), circuit)
-# permutations = predict_permutation_gumbel(model, tableau)
+# # permutations = predict_permutation_gumbel(model, tableau)
+# # permutations = predict_permutation_beam(model, tableau)
+# permutations = entropy_guided_search(model, tableau)
 # print(permutations)
 
 # # Example 2 of usage (with SL fine-tuning):
