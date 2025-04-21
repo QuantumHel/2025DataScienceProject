@@ -38,6 +38,8 @@ from src.nn.permutation_math import (
     predict_permutation_gumbel,
     predict_permutation_beam,
     entropy_guided_search,
+    ensemble_predict_permutation,
+    curriculum_train,
 )
 
 # Suppress all overflow warnings globally
@@ -148,6 +150,7 @@ def dummy_perm_compilation(
     # best_permutation = predict_permutation_gumbel(model, clifford_tableau)
     # best_permutation = predict_permutation_beam(model, clifford_tableau)
     best_permutation = entropy_guided_search(model, clifford_tableau)
+    # best_permutation = ensemble_predict_permutation(model, clifford_tableau)
     best_permutation = iter(best_permutation[0])
 
     def pick_pivot_callback(
@@ -174,6 +177,9 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
     model = pretrain_a_model_from_file(
         "nn/training_data_perm.pkl", max_samples=None, epochs=50
     )
+    # model = curriculum_train(
+    #     "nn/training_data_perm.pkl", max_samples=None, epochs_per_stage=25
+    # )
     # sl_dataset = TableauPermutationDataset(
     #     "nn/training_data_perm_4_qubit.pkl", n_qubits=4, max_samples=320
     # )

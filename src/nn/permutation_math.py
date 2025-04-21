@@ -250,7 +250,7 @@ class ResidualCXBlock(nn.Module):
 
 class OrderedPermutationTransformer(nn.Module):
     # def __init__(self, n_qubits, dim=128, num_layers=4):
-    def __init__(self, n_qubits, dim=256, num_layers=4, num_heads=8):
+    def __init__(self, n_qubits, dim=256, num_layers=4, num_heads=8, dropout=0.1):
         super().__init__()
         self.n_qubits = n_qubits
         self.dim = dim
@@ -281,10 +281,12 @@ class OrderedPermutationTransformer(nn.Module):
             nn.Conv2d(2, 32, 3, padding=1),
             nn.GELU(),
             nn.BatchNorm2d(32),
+            nn.Dropout2d(dropout / 2),  # New dropout, results?
             SelfAttentionBlock(32),  # Add self-attention between conv layers
             nn.Conv2d(32, 64, 3, padding=1),
             nn.GELU(),
             nn.BatchNorm2d(64),
+            nn.Dropout2d(dropout / 2),  # New dropout, results?
             SelfAttentionBlock(64),  # Add self-attention between conv layers
             nn.Conv2d(64, 64, 3, padding=1),
             nn.GELU(),
@@ -321,9 +323,9 @@ class OrderedPermutationTransformer(nn.Module):
         #     num_layers=num_layers,
         # )
 
-        # Try a CX-aware decoder, results?
+        # Try a CX-aware decoder, not improving
         self.decoder = PermutationCXAwareDecoder(
-            dim=dim, n_qubits=n_qubits, num_layers=num_layers, nhead=4
+            dim=dim, n_qubits=n_qubits, num_layers=num_layers, nhead=num_heads
         )
 
         # Position-Aware Prediction Heads
@@ -390,6 +392,12 @@ class OrderedPermutationTransformer(nn.Module):
             nn.Linear(64, 1),
             nn.ReLU(),  # Use ReLU instead of Softplus for sharper predictions
         )
+
+        # Try Add initialization here, after defining all components, results?
+        # Enhanced initialization
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.kaiming_normal_(p, mode="fan_out", nonlinearity="relu")
 
     def forward(self, tableau):
         # Encode Tableau
@@ -477,11 +485,33 @@ class SequentialSinkhorn(nn.Module):
 
 class OrderedPermutationLoss(nn.Module):
     # def __init__(self, alpha=0.5, beta=0.1):
-    def __init__(self, alpha=0.5, beta=0.1, gamma=2.0):
+    # def __init__(self, alpha=0.5, beta=0.1, gamma=2.0): # original
+    def __init__(
+        self, alpha=0.5, beta=0.1, gamma=2.0, entropy_weight=0.1, max_entropy=0.5
+    ):  # gamma=8.0 will sometimes result in stuck at loss 270.0
         super().__init__()
         self.alpha = alpha  # Stop signal loss weight
         self.beta = beta  # Length regularization weight
         self.gamma = gamma  # CX prediction loss weight
+        # self.entropy_weight = entropy_weight  # Entropy regularization weight
+        # self.max_entropy = max_entropy  # Max entropy for scaling
+        # self.plateau_counter = 0
+
+    # # Try adjusting entropy weight dynamically (the model is stuck at loss 170.0)
+    # def adjust_entropy_weight(self, current_loss, prev_loss, patience=3):
+    #     """Dynamically adjust entropy weight based on training progress"""
+    #     if current_loss > prev_loss * 0.995:  # No significant improvement
+    #         self.plateau_counter += 1
+    #         if self.plateau_counter >= patience:
+    #             # Increase entropy to escape local minimum
+    #             self.entropy_weight = min(self.entropy_weight * 1.5, self.max_entropy)
+    #             self.plateau_counter = 0
+    #             return True
+    #     else:
+    #         # Improving - gradually reduce entropy
+    #         self.entropy_weight = max(self.entropy_weight * 0.9, 0.05)
+    #         self.plateau_counter = 0
+    #     return False
 
     # def forward(self, preds, stop_logits, targets, masks):
     def forward(
@@ -497,26 +527,85 @@ class OrderedPermutationLoss(nn.Module):
         """
         bs, seq_len = stop_logits.shape  # Use stop_logits shape instead of masks
 
-        # 1. Permutation matrix loss (masked)
-        # Make sure targets has same sequence length as preds
-        if targets.size(1) < preds.size(1):
-            padding = torch.zeros(
-                bs,
-                preds.size(1) - targets.size(1),
-                *targets.shape[2:],
-                device=targets.device,
-            )
-            targets = torch.cat([targets, padding], dim=1)
+        # # 1. Permutation matrix loss (masked)
+        # # Make sure targets has same sequence length as preds
+        # if targets.size(1) < preds.size(1):
+        #     padding = torch.zeros(
+        #         bs,
+        #         preds.size(1) - targets.size(1),
+        #         *targets.shape[2:],
+        #         device=targets.device,
+        #     )
+        #     targets = torch.cat([targets, padding], dim=1)
 
-        perm_loss = F.mse_loss(preds, targets, reduction="none")
+        # perm_loss = F.mse_loss(preds, targets, reduction="none")
 
-        # If masks is too short, pad it
-        if masks.size(1) < seq_len:
-            mask_padding = torch.zeros(bs, seq_len - masks.size(1), device=masks.device)
-            masks = torch.cat([masks, mask_padding], dim=1)
+        # # If masks is too short, pad it
+        # if masks.size(1) < seq_len:
+        #     mask_padding = torch.zeros(bs, seq_len - masks.size(1), device=masks.device)
+        #     masks = torch.cat([masks, mask_padding], dim=1)
 
-        perm_loss = perm_loss.mean(dim=(-1, -2)) * masks  # [bs, seq_len]
-        perm_loss = perm_loss.sum() / masks.sum().clamp(min=1.0)  # Avoid div by zero
+        # perm_loss = perm_loss.mean(dim=(-1, -2)) * masks  # [bs, seq_len]
+        # perm_loss = perm_loss.sum() / masks.sum().clamp(min=1.0)  # Avoid div by zero
+
+        # 1. Try computing permutation loss for each valid target and use the minimum
+        perm_losses = []
+        for i in range(len(preds)):
+            losses = []
+            for valid_seq in targets[i]:  # valid_seq: [seq_len, n, n]
+                # Pad valid_seq if needed
+                if valid_seq.size(0) < preds[i].size(
+                    0
+                ):  # Compare sequence lengths (dim 0)
+                    n = valid_seq.size(-1)  # Get n_qubits dimension size
+                    padding = torch.zeros(
+                        preds[i].size(0) - valid_seq.size(0),
+                        n,
+                        n,
+                        device=valid_seq.device,
+                    )
+                    valid_seq_padded = torch.cat(
+                        [valid_seq, padding], dim=0
+                    )  # Along seq dim
+                else:
+                    valid_seq_padded = valid_seq[
+                        : preds[i].size(0)
+                    ]  # Truncate if too long
+
+                # # Try adding label smoothing (the model is stuck at loss 170.0)
+                # smoothing = 0.1
+                # valid_seq_padded = valid_seq_padded * (1 - smoothing) + smoothing / n
+
+                loss = (
+                    F.mse_loss(preds[i], valid_seq_padded, reduction="none").mean(
+                        dim=(-1, -2)
+                    )
+                    * masks[i]
+                )
+                # # Further try: adding KL divergence loss (the model is stuck at loss 170.0)
+                # mse_loss = (
+                #     F.mse_loss(preds[i], valid_seq_padded, reduction="none").mean(
+                #         dim=(-1, -2)
+                #     )
+                #     * masks[i]
+                # )
+                # # Add KL divergence loss (sharper probabilities)
+                # preds_softmax = F.softmax(
+                #     preds[i] * 10, dim=-1
+                # )  # Temperature for sharpness
+                # target_softmax = F.softmax(valid_seq_padded * 10, dim=-1)
+                # kl_loss = (
+                #     F.kl_div(preds_softmax.log(), target_softmax, reduction="none").sum(
+                #         dim=(-1, -2)
+                #     )
+                #     * masks[i]
+                # )
+                # # Combine losses
+                # loss = 0.7 * mse_loss + 0.3 * kl_loss
+                loss = loss.sum() / masks[i].sum().clamp(min=1.0)
+                losses.append(loss)
+            perm_losses.append(torch.stack(losses).min())
+        perm_loss = torch.stack(perm_losses).mean()
 
         # 2. Stop signal loss with properly sized tensors
         # Create stop_labels with the right size [bs, seq_len]
@@ -550,14 +639,29 @@ class OrderedPermutationLoss(nn.Module):
             if cx_targets.dim() == 1:
                 cx_targets = cx_targets.unsqueeze(1).expand(-1, cx_preds.size(1))
 
-            # Use MSE loss for regression (no sigmoid needed with ReLU output)
+            # Use MSE loss for regression (no sigmoid needed with ReLU output), grows quadratically
             cx_loss = F.mse_loss(cx_preds, cx_targets, reduction="mean")
+            # Try Replace MSE with Huber loss for CX prediction, results not that good? less sensitive to outliers, grows linearly
+            # cx_loss = F.huber_loss(cx_preds, cx_targets, reduction="mean")
+
+        # # 5. Try Adding Entropy regularization (encourage exploration, not improving)
+        # # preds: [bs, seq_len, n, n]
+        # entropy = 0
+        # bs, seq_len, n, _ = preds.shape
+        # for b in range(bs):
+        #     for t in range(seq_len):
+        #         p = preds[b, t]
+        #         p = p / (p.sum() + 1e-8)  # Normalize
+        #         entropy -= (p * (p + 1e-8).log()).sum()  # Negative entropy
+
+        # entropy = entropy / (bs * seq_len)
 
         return (
             perm_loss
             + self.alpha * stop_loss
             + self.beta * length_loss
             + self.gamma * cx_loss
+            # + self.entropy_weight * entropy  # Add entropy regularization (not improving)
         )
 
 
@@ -566,8 +670,20 @@ def train(model, dataloader, epochs=100, device=None):
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=2e-4, total_steps=epochs * len(dataloader), pct_start=0.3
-    )
+        optimizer, max_lr=5e-4, total_steps=epochs * len(dataloader), pct_start=0.3
+    )  # increase max_lr from 2e-4 to 5e-4, results, not improving!
+    # # Try another scheduler, results, not good
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer, T_max=epochs, eta_min=1e-6, last_epoch=-1
+    # )
+    # # Try aggressive restart???
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    #     optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    # )
+    # # # Gradient clipping, introduced with CosineAnnealingLR and CosineAnnealingWarmRestarts
+    # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+
+    # Loss function
     criterion = OrderedPermutationLoss(gamma=5.0)  # Adjust gamma as needed
     # sinkhorn = SequentialSinkhorn()
 
@@ -579,6 +695,7 @@ def train(model, dataloader, epochs=100, device=None):
     # best_model_state = None
     # validation_scores = []
 
+    # prev_loss = float("inf")
     for epoch in range(epochs):
         model.train()
         total_loss = 0
@@ -590,7 +707,10 @@ def train(model, dataloader, epochs=100, device=None):
             # print(f"raw_targets: {raw_targets}")
             # 1. Prepare batch -------------------------------------------------
             # Convert raw targets to padded tensor
-            targets, masks = pad_targets(raw_targets, device)
+            # targets, masks = pad_targets(raw_targets, device)
+            targets, masks = pad_targets_all_seq(
+                raw_targets, device
+            )  # try returning all sequences
 
             # Move data to device
             tableaus = tableaus.to(device)
@@ -617,6 +737,10 @@ def train(model, dataloader, epochs=100, device=None):
                         logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
                         logits = logits - torch.logsumexp(logits, dim=-2, keepdim=True)
                     seq_preds.append(torch.exp(logits / 0.1))
+                    # # Try Applying another Sinkhorn normalization, worse!
+                    # # Temperature annealing (start high, decrease during training)
+                    # current_temp = max(0.5, 1.0 - epoch / epochs * 0.8)
+                    # seq_preds.append(tiny_gumbel_sinkhorn(logits, temp=current_temp))
                 sinkhorn_preds.append(torch.stack(seq_preds))
             preds = torch.stack(sinkhorn_preds)  # [batch_size, seq_len, n, n]
 
@@ -649,7 +773,8 @@ def train(model, dataloader, epochs=100, device=None):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-                scheduler.step()
+                scheduler.step()  # For OneCycleLR
+                # scheduler.step(epoch + batch_idx / len(dataloader))  # For WarmRestarts
 
             # 7. Logging ------------------------------------------------------
             total_loss += loss.item()
@@ -660,6 +785,13 @@ def train(model, dataloader, epochs=100, device=None):
 
         # 8. Epoch summary -----------------------------------------------------
         avg_loss = total_loss / batches
+        # # Try adjusting entropy weight dynamically
+        # entropy_increased = criterion.adjust_entropy_weight(avg_loss, prev_loss)
+        # if entropy_increased:
+        #     print(
+        #         f"Increased entropy weight to {criterion.entropy_weight:.4f} to escape local minimum"
+        #     )
+        # prev_loss = avg_loss  # Try adjusting entropy weight dynamically
         loss_history.append(avg_loss)
         print(f"Epoch {epoch+1} completed | Average Loss: {avg_loss:.4f}")
 
@@ -735,6 +867,52 @@ def pad_targets(raw_targets, device):
     )
 
     return padded.to(device), mask.to(device)
+
+
+# Try returning all permutation sequences
+def pad_targets_all_seq(raw_targets, device):
+    """
+    Returns:
+        all_padded_sequences: list of [num_valid_seqs, max_len, n, n] tensors (per batch item)
+        masks: [batch_size, max_len] tensor (mask for the longest sequence in the batch)
+    """
+    all_sequences = []
+    max_len = 0
+    n_qubits = None
+
+    # Gather all valid sequences and find max length
+    for item in raw_targets:
+        perm_sequences = item[0]  # list of valid sequences
+        all_sequences.append(perm_sequences)
+        for seq in perm_sequences:
+            if n_qubits is None and len(seq) > 0:
+                n_qubits = seq[0].shape[0]
+            max_len = max(max_len, len(seq))
+
+    # Pad all sequences to max_len
+    all_padded_sequences = []
+    for perm_sequences in all_sequences:
+        padded_seqs = []
+        for seq in perm_sequences:
+            seq_len = len(seq)
+            if seq_len < max_len:
+                pad = [torch.eye(n_qubits, device=device)] * (max_len - seq_len)
+                padded_seq = torch.stack(seq + pad)
+            else:
+                padded_seq = torch.stack(seq[:max_len])
+            padded_seqs.append(padded_seq)
+        all_padded_sequences.append(
+            torch.stack(padded_seqs)
+        )  # [num_valid_seqs, max_len, n, n]
+
+    # Create masks for the longest sequence in the batch (used for all)
+    mask = torch.zeros(len(all_sequences), max_len, device=device)
+    for i, perm_sequences in enumerate(all_sequences):
+        # Use the length of the longest sequence for this sample
+        seq_len = max(len(seq) for seq in perm_sequences)
+        mask[i, :seq_len] = 1
+
+    return all_padded_sequences, mask
 
 
 class TableauPermutationDataset(Dataset):
@@ -891,7 +1069,9 @@ def pretrain_a_model_from_file(
 ):
     n_qubits = 4
     # model = OrderedPermutationTransformer(n_qubits=n_qubits)
-    model = OrderedPermutationTransformer(n_qubits=4, dim=256, num_layers=6)
+    model = OrderedPermutationTransformer(
+        n_qubits=4, dim=256, num_layers=12
+    )  # Try wider model 6 -> 12
     dataset = TableauPermutationDataset(
         data_file, n_qubits=n_qubits, max_samples=max_samples
     )
@@ -1360,7 +1540,7 @@ def compute_weighted_score(pred_metrics):
     """
     # Define weights for each metric
     cx_weight = 10.0  # Try adjusting from 10 to 50; 50 not good either
-    depth_weight = 1.0
+    depth_weight = 1.0  # 1.0 seems better than 0.1???
     # Compute weighted score, only keep cx seems worse
     score = cx_weight * pred_metrics["cx"] + depth_weight * pred_metrics["depth"]
     # score = pred_metrics["cx"]
@@ -1509,10 +1689,25 @@ def gumbel_sinkhorn(logits, temp=0.1, n_samples=5):
         for _ in range(20):
             s = s - torch.logsumexp(s, dim=-1, keepdim=True)
             s = s - torch.logsumexp(s, dim=-2, keepdim=True)
-        samples.append(torch.exp(s))
+        # samples.append(torch.exp(s))
+        # Try Add final softmax instead of exp() for better numerical stability (results?)
+        samples.append(F.softmax(s, dim=-1))
 
     # Return all samples (don't average - keep the diversity)
     return samples
+
+
+def tiny_gumbel_sinkhorn(logits, temp=1.0, n_iters=20):
+    gumbels = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10))
+    noisy_logits = (logits + gumbels) / temp
+    for _ in range(n_iters):
+        noisy_logits = noisy_logits - torch.logsumexp(
+            noisy_logits, dim=-1, keepdim=True
+        )
+        noisy_logits = noisy_logits - torch.logsumexp(
+            noisy_logits, dim=-2, keepdim=True
+        )
+    return torch.exp(noisy_logits)
 
 
 def predict_permutation_gumbel(model, clifford_tableau, device="cpu"):
@@ -1555,7 +1750,7 @@ def predict_permutation_gumbel(model, clifford_tableau, device="cpu"):
             logits = raw_preds[0, step_idx]
 
             # Generate multiple permutation samples with Gumbel-Sinkhorn
-            perm_samples = gumbel_sinkhorn(logits, temp=0.1, n_samples=5)
+            perm_samples = gumbel_sinkhorn(logits, temp=0.1, n_samples=10)
             for sample_matrix in perm_samples:
                 perm_matrix = sample_matrix.cpu().numpy()
 
@@ -1877,13 +2072,687 @@ def entropy_guided_search(model, clifford_tableau, device="cpu", n_samples=5):
         return [best_perm]  # Keep list format for compatibility
 
 
+def ensemble_predict_permutation(model, tableau, device="cpu"):
+    """Run multiple permutation prediction strategies and select best result"""
+    candidates = []
+
+    # Run all prediction strategies
+    gumbel_perms = predict_permutation_gumbel(model, tableau, device)
+    entropy_perms = entropy_guided_search(model, tableau, device, n_samples=8)
+
+    # Add more aggressive temperature sampling
+    tableau_tensor = tableau_to_tensor(tableau).unsqueeze(0).to(device)
+    with torch.no_grad():
+        raw_preds, _, cx_preds = model(tableau_tensor)
+        # Try extreme temperatures for more diversity
+        for temp in [0.005, 1.0]:  # Very low and very high temps
+            perm_samples = gumbel_sinkhorn(raw_preds[0, 0], temp=temp, n_samples=5)
+            for sample in perm_samples:
+                perm_matrix = sample.cpu().numpy()
+                row_ind, col_ind = linear_sum_assignment(-perm_matrix)
+                candidates.append([(int(i), int(j)) for i, j in zip(row_ind, col_ind)])
+
+    # Add the candidates from standard methods
+    candidates.extend(gumbel_perms)
+    candidates.extend(entropy_perms)
+
+    # Evaluate all candidates
+    topology = Topology.complete(tableau.n_qubits)
+    best_perm = None
+    best_score = float("inf")
+    best_metrics = None
+
+    for perm in candidates:
+        # Evaluate permutation
+        pred_iter = iter(perm)
+
+        def pred_callback(G, remaining, remaining_rows, choice_fn=min):
+            try:
+                row, col = next(pred_iter)
+                # Convert to int if they're tensors
+                if isinstance(row, torch.Tensor):
+                    row = row.item()
+                if isinstance(col, torch.Tensor):
+                    col = col.item()
+                return int(row), int(col)  # Ensure integers
+            except StopIteration:
+                row = choice_fn(remaining_rows)
+                return row, row
+                # Try smarter fallback, also no big improvement as expected
+            except StopIteration:
+                # Use graph analysis for better pivot selection
+                row = choice_fn(remaining_rows)
+
+                if G[row]:
+                    # Choose column with highest impact
+                    impact_scores = {}
+                    for col in G[row]:
+                        # Count affected rows
+                        impact = sum(1 for r in remaining_rows if col in G[r])
+                        impact_scores[col] = impact
+
+                    col = max(impact_scores.items(), key=lambda x: x[1])[0]
+                else:
+                    col = row
+
+                return int(row), int(col)
+
+        circuit = synthesize_tableau_perm_row_col(
+            tableau, topology, pick_pivot_callback=pred_callback
+        )
+        metrics = collect_circuit_data(circuit)
+        score = compute_weighted_score(metrics)
+
+        if score < best_score:
+            best_score = score
+            best_perm = perm
+            best_metrics = metrics
+
+    # print(f"Ensemble best: CX={best_metrics['cx']}, Depth={best_metrics['depth']}")
+    return [best_perm]
+
+
+# import math
+# import random
+# import copy
+
+
+# class MCTSNode:
+#     def __init__(self, tableau, parent=None, pivot=None, remaining_rows=None):
+#         """A node in the MCTS search tree representing a partial pivot sequence"""
+#         self.tableau = tableau  # Current tableau state
+#         self.parent = parent  # Parent node
+#         self.pivot = pivot  # (row, col) that led to this node
+#         self.children = {}  # Map from pivot to child nodes
+#         self.visits = 0  # Number of visits
+#         self.reward = 0  # Cumulative reward
+#         self.remaining_rows = remaining_rows  # Rows still needing pivots
+#         self.valid_pivots = None  # Cache of valid pivots
+
+#     def is_fully_expanded(self):
+#         """Check if all possible pivot choices have been tried"""
+#         return len(self.get_valid_pivots()) == 0 or len(self.children) == len(
+#             self.get_valid_pivots()
+#         )
+
+#     def is_terminal(self):
+#         """Check if this is a terminal node (no more rows to eliminate)"""
+#         if self.remaining_rows is None:
+#             self.remaining_rows = self._get_remaining_rows()
+#         return len(self.remaining_rows) == 0
+
+#     def _get_remaining_rows(self):
+#         """Get rows that still need pivots"""
+#         # Simple implementation: if a node doesn't have remaining rows explicitly set,
+#         # use parent's remaining rows minus the current pivot row
+#         if self.parent is None:
+#             # Root node - all rows need pivots
+#             return list(range(self.tableau.n_qubits))
+#         elif self.pivot is None:
+#             # No pivot applied - same rows as parent
+#             return (
+#                 self.parent.remaining_rows.copy() if self.parent.remaining_rows else []
+#             )
+#         else:
+#             # Remove current pivot row from parent's remaining rows
+#             return [r for r in self.parent.remaining_rows if r != self.pivot[0]]
+
+#     def get_valid_pivots(self):
+#         """Get all valid (row,col) pivots from this tableau state"""
+#         if self.valid_pivots is None:
+#             self.valid_pivots = []
+
+#             if self.remaining_rows is None:
+#                 self.remaining_rows = self._get_remaining_rows()
+
+#             # For each remaining row, find all columns with 1 in tableau
+#             for row in self.remaining_rows:
+#                 for col in range(
+#                     self.tableau.n_qubits
+#                 ):  # Only check first n_qubits columns
+#                     if self.tableau._x_out(row, col) == 1:
+#                         self.valid_pivots.append((row, col))
+
+#         # Filter out pivots that already have children
+#         return [p for p in self.valid_pivots if p not in self.children]
+
+#     def select_child(self, exploration_weight=1.0):
+#         """Select child using UCB1 formula"""
+#         if not self.children:
+#             return None
+
+#         # UCB1 formula: exploitation + exploration
+#         log_visits = math.log(self.visits + 1e-10)
+
+#         def ucb_score(child):
+#             exploitation = child.reward / (child.visits + 1e-10)
+#             exploration = exploration_weight * math.sqrt(
+#                 log_visits / (child.visits + 1e-10)
+#             )
+#             return exploitation + exploration
+
+#         return max(self.children.values(), key=ucb_score)
+
+#     def apply_pivot_to_tableau(tableau, pivot):
+#         """Apply the pivot operation to transform the tableau
+
+#         This simulates the row operation in Gaussian elimination
+#         that happens when a pivot (row, col) is selected
+#         """
+#         row, col = pivot
+#         n_qubits = tableau.n_qubits
+
+#         # Get the set of rows that need to be modified
+#         # (rows that have a 1 in the pivot column)
+#         rows_to_modify = []
+#         for r in range(2 * n_qubits):
+#             if r != row and tableau.tableau[r, col] == 1:
+#                 rows_to_modify.append(r)
+
+#         # Apply the row operations (XOR the pivot row with each affected row)
+#         for r in rows_to_modify:
+#             # Update tableau bits
+#             for c in range(2 * n_qubits):
+#                 if tableau.tableau[row, c] == 1:
+#                     tableau.tableau[r, c] = tableau.tableau[r, c] ^ 1
+
+#             # Update signs if necessary
+#             if tableau.tableau[row, col] == 1 and tableau.tableau[r, col] == 1:
+#                 tableau.signs[r] = tableau.signs[r] ^ tableau.signs[row]
+
+#     def add_child(self, pivot, tableau, remaining_rows):
+#         """Add a child node with the given pivot and transformed tableau"""
+#         # Create deep copy of the tableau
+#         import copy as py_copy
+
+#         new_tableau = py_copy.deepcopy(tableau)
+
+#         # Apply the pivot transformation to the new tableau
+#         MCTSNode.apply_pivot_to_tableau(new_tableau, pivot)
+
+#         # Create child with the transformed tableau
+#         child = MCTSNode(new_tableau, self, pivot, remaining_rows)
+#         self.children[pivot] = child
+#         return child
+
+#     def get_path_from_root(self):
+#         """Get sequence of pivots from root to this node"""
+#         path = []
+#         node = self
+#         while node.parent is not None:
+#             if node.pivot is not None:
+#                 path.append(node.pivot)
+#             node = node.parent
+
+#         path.reverse()  # Root to leaf order
+#         return path
+
+
+# def predict_permutation_mcts(model, clifford_tableau, device="cpu", n_simulations=100):
+#     """MCTS-based permutation search with neural guidance"""
+#     device = torch.device(device)
+#     model = model.to(device)
+
+#     # Create root node
+#     root = MCTSNode(clifford_tableau)
+#     topology = Topology.complete(clifford_tableau.n_qubits)
+
+#     # Create a cache for tableau evaluations to avoid repeated synthesis
+#     evaluation_cache = {}
+
+#     # Run MCTS simulations
+#     for i in range(n_simulations):
+#         # Phase 1: Selection - traverse tree using UCB until we reach a non-fully expanded node
+#         node = root
+#         while node.is_fully_expanded() and not node.is_terminal():
+#             next_node = node.select_child(exploration_weight=1.5)
+#             if next_node is None:
+#                 # No children to select, break the loop
+#                 break
+#             node = next_node  # Only update if non-None
+
+#         # Phase 2: Expansion - add a new child node if not terminal
+#         if not node.is_terminal():
+#             # Get neural predictions to guide expansion
+#             tableau_tensor = tableau_to_tensor(node.tableau)
+#             tableau_tensor = tableau_tensor.unsqueeze(0).to(device)
+
+#             with torch.no_grad():
+#                 # Get model predictions for current state
+#                 raw_preds, _, cx_preds = model(tableau_tensor)
+
+#                 # Use these predictions to bias pivot selection
+#                 valid_pivots = node.get_valid_pivots()
+#                 if valid_pivots:
+#                     # Extract pivot probabilities from model output
+#                     logits = raw_preds[0, 0]  # Use first step prediction
+
+#                     # Apply Sinkhorn normalization
+#                     for _ in range(20):
+#                         logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+#                         logits = logits - torch.logsumexp(logits, dim=-2, keepdim=True)
+
+#                     probs = torch.exp(logits / 0.1)
+
+#                     # Calculate probability scores for valid pivots
+#                     pivot_scores = {}
+#                     for row, col in valid_pivots:
+#                         pivot_scores[(row, col)] = probs[row, col].item()
+
+#                     # Weighted selection based on model probabilities
+#                     total_score = sum(pivot_scores.values()) + 1e-10  # Avoid div by 0
+#                     rand_val = random.random() * total_score
+#                     cumulative = 0
+#                     selected_pivot = valid_pivots[0]  # Default in case of issues
+
+#                     for pivot, score in pivot_scores.items():
+#                         cumulative += score
+#                         if cumulative >= rand_val:
+#                             selected_pivot = pivot
+#                             break
+
+#                     # Apply the selected pivot to create new tableau state
+#                     # new_tableau = node.tableau
+
+#                     # When pivot is applied, the row is eliminated
+#                     new_remaining = [
+#                         r for r in node.remaining_rows if r != selected_pivot[0]
+#                     ]
+
+#                     # Create and add the new child
+#                     node = node.add_child(selected_pivot, node.tableau, new_remaining)
+
+#         # Phase 3: Simulation phase
+#         # Force complete sequence with exactly n_qubits pivots
+#         sequence = node.get_path_from_root()
+#         completed_sequence = force_complete_sequence(
+#             sequence, node.tableau, clifford_tableau.n_qubits
+#         )
+#         reward = evaluate_sequence(
+#             completed_sequence, clifford_tableau, topology, evaluation_cache
+#         )
+
+#         # Phase 4: Backpropagation
+#         while node is not None:
+#             node.visits += 1
+#             node.reward += reward
+#             node = node.parent
+
+#     # Get best sequence and ensure it's complete
+#     best_sequence = get_complete_sequence(root, clifford_tableau.n_qubits)
+#     return [best_sequence]
+
+
+# def force_complete_sequence(partial_sequence, tableau, n_qubits):
+#     """Complete a partial sequence with valid pivots at each step"""
+#     # Make a copy and apply partial sequence to track tableau state
+#     import copy as py_copy
+
+#     current_tableau = py_copy.deepcopy(tableau)
+
+#     # Apply all pivots in partial sequence to track tableau state
+#     for row, col in partial_sequence:
+#         MCTSNode.apply_pivot_to_tableau(current_tableau, (row, col))
+
+#     # Find remaining rows
+#     handled_rows = set(pivot[0] for pivot in partial_sequence)
+#     missing_rows = set(range(n_qubits)) - handled_rows
+
+#     # Build completion with valid pivots
+#     completed_sequence = partial_sequence.copy()
+
+#     for row in missing_rows:
+#         # Try to find any valid pivot for this row
+#         found = False
+#         for col in range(n_qubits):  # Try all columns
+#             if current_tableau._x_out(row, col) == 1:
+#                 completed_sequence.append((row, col))
+#                 found = True
+#                 # Update tableau state
+#                 MCTSNode.apply_pivot_to_tableau(current_tableau, (row, col))
+#                 break
+
+#         if not found:  # If no valid pivot, this is an invalid sequence
+#             return partial_sequence  # Return the original sequence as a signal
+
+#     return completed_sequence
+
+
+# def get_complete_sequence(root, n_qubits):
+#     """Get the best complete sequence from the MCTS tree"""
+#     # First traverse the tree to get the best path (might be incomplete)
+#     node = root
+#     sequence = []
+
+#     # We want EXACTLY one pivot per qubit (i.e., n_qubits total pivots)
+#     handled_rows = set()
+
+#     # First try to extract sequence from tree
+#     while node.children and len(handled_rows) < n_qubits:
+#         if not node.children:
+#             break
+
+#         # Select best child
+#         best_child = max(
+#             node.children.values(), key=lambda n: n.reward / (n.visits + 1e-10)
+#         )
+#         if best_child.pivot:
+#             row, col = best_child.pivot
+#             sequence.append((row, col))
+#             handled_rows.add(row)
+#         node = best_child
+
+#     # Now ensure we have exactly one pivot for each row
+#     missing_rows = set(range(n_qubits)) - handled_rows
+#     duplicate_check = {}
+
+#     # Clean up any duplicates from the sequence
+#     clean_sequence = []
+#     used_rows = set()
+
+#     for row, col in sequence:
+#         if row not in used_rows:
+#             clean_sequence.append((row, col))
+#             used_rows.add(row)
+
+#     # Add missing rows with valid pivots - important to use the ORIGINAL tableau
+#     # since we need pivots that are valid in the initial state
+#     for row in missing_rows:
+#         # Try to find a non-diagonal pivot first
+#         found = False
+#         for col in range(n_qubits):
+#             if col != row and root.tableau._x_out(row, col) == 1:
+#                 clean_sequence.append((row, col))
+#                 found = True
+#                 break
+
+#         if not found:  # Fall back to diagonal
+#             clean_sequence.append((row, row))
+
+#     # Ensure we have exactly n_qubits pivots
+#     assert (
+#         len(clean_sequence) == n_qubits
+#     ), f"Invalid sequence length: {len(clean_sequence)} vs {n_qubits}"
+
+#     # Verify each row appears exactly once
+#     rows = [r for r, _ in clean_sequence]
+#     assert len(set(rows)) == n_qubits, f"Rows aren't unique: {rows}"
+
+#     return clean_sequence
+
+
+# def get_best_sequence(root):
+#     """Extract best pivot sequence from the MCTS tree"""
+#     if not root.children:
+#         return []
+
+#     # Find child with highest average reward
+#     best_child = max(
+#         root.children.values(), key=lambda n: n.reward / (n.visits + 1e-10)
+#     )
+
+#     # Build sequence
+#     sequence = [best_child.pivot]
+
+#     # Recursively add best children
+#     current = best_child
+#     while current.children:
+#         if not current.children:
+#             break
+
+#         best_child = max(
+#             current.children.values(), key=lambda n: n.reward / (n.visits + 1e-10)
+#         )
+#         if best_child.pivot:
+#             sequence.append(best_child.pivot)
+#         current = best_child
+
+#     return sequence
+
+
+# def simulate_to_completion(
+#     partial_sequence, tableau, model, device, topology, cache=None
+# ):
+#     """Complete a partial pivot sequence with neural guidance"""
+#     remaining_rows = [
+#         r
+#         for r in range(tableau.n_qubits)
+#         if r not in [pivot[0] for pivot in partial_sequence]
+#     ]
+
+#     # Starting with the partial sequence
+#     sequence = partial_sequence.copy()
+
+#     # Complete sequence using model guidance
+#     while remaining_rows:
+#         # Get neural predictions
+#         tableau_tensor = tableau_to_tensor(tableau)
+#         tableau_tensor = tableau_tensor.unsqueeze(0).to(device)
+
+#         with torch.no_grad():
+#             raw_preds, _, cx_preds = model(tableau_tensor)
+
+#             # Get valid pivots
+#             valid_pivots = []
+#             for row in remaining_rows:
+#                 for col in range(tableau.n_qubits):
+#                     if tableau._x_out(row, col) == 1:
+#                         valid_pivots.append((row, col))
+
+#             if not valid_pivots:  # Should not happen with valid tableaus
+#                 break
+
+#             # Sample next pivot using model probabilities
+#             logits = raw_preds[0, 0]
+
+#             # Apply Sinkhorn normalization
+#             for _ in range(20):
+#                 logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+#                 logits = logits - torch.logsumexp(logits, dim=-2, keepdim=True)
+
+#             probs = torch.exp(logits / 0.1)
+
+#             # Weighted selection among valid pivots
+#             pivot_scores = {}
+#             for row, col in valid_pivots:
+#                 pivot_scores[(row, col)] = probs[row, col].item()
+
+#             # Select pivot with temperature-based sampling
+#             temperature = 0.5  # Adjust for exploration/exploitation balance
+#             pivot_weights = {
+#                 p: math.exp(s / temperature) for p, s in pivot_scores.items()
+#             }
+#             total_weight = sum(pivot_weights.values()) + 1e-10
+
+#             rand_val = random.random() * total_weight
+#             cumulative = 0
+#             next_pivot = valid_pivots[0]  # Default fallback
+
+#             for pivot, weight in pivot_weights.items():
+#                 cumulative += weight
+#                 if cumulative >= rand_val:
+#                     next_pivot = pivot
+#                     break
+
+#             # Update sequence and state
+#             sequence.append(next_pivot)
+#             remaining_rows = [r for r in remaining_rows if r != next_pivot[0]]
+
+#     # Evaluate completed sequence
+#     return evaluate_sequence(sequence, tableau, topology, cache)
+
+
+# def evaluate_sequence(sequence, tableau, topology, cache=None):
+#     """Evaluate a pivot sequence by synthesizing the circuit"""
+#     if cache is not None:
+#         # Check cache first
+#         key = tuple(sequence)
+#         if key in cache:
+#             return cache[key]
+
+#     pred_iter = iter(sequence)
+
+#     def pred_callback(G, remaining, remaining_rows, choice_fn=min):
+#         try:
+#             row, col = next(pred_iter)
+#             if isinstance(row, torch.Tensor):
+#                 row = row.item()
+#             if isinstance(col, torch.Tensor):
+#                 col = col.item()
+
+#             # Verify pivot is valid
+#             if (
+#                 hasattr(remaining, "_x_out")
+#                 and remaining._x_out(int(row), int(col)) == 1
+#             ):
+#                 return int(row), int(col)
+#             else:
+#                 raise StopIteration
+
+#         except StopIteration:
+#             # Safe fallback for valid pivot
+#             for r in remaining_rows:
+#                 for c in range(
+#                     remaining.n_qubits
+#                 ):  # Only first n_qubits to avoid index error
+#                     if remaining._x_out(r, c) == 1:
+#                         return int(r), int(c)
+
+#             # Last resort
+#             if remaining_rows:
+#                 row = min(remaining_rows)
+#                 return int(row), int(row)
+#             else:
+#                 return 0, 0
+
+#     try:
+#         circuit = synthesize_tableau_perm_row_col(
+#             tableau, topology, pick_pivot_callback=pred_callback
+#         )
+#         metrics = collect_circuit_data(circuit)
+
+#         # Calculate reward (focus heavily on CX count)
+#         # Using negative score as reward (since MCTS maximizes reward)
+#         score = compute_weighted_score(metrics)
+#         reward = 100.0 / (
+#             score + 1.0
+#         )  # Transform to positive reward that increases with quality
+
+#         # Cache the result
+#         if cache is not None:
+#             cache[tuple(sequence)] = reward
+
+#         return reward
+
+#     except Exception as e:
+#         # Handle synthesis failures gracefully
+#         return 0.0  # Worst possible reward
+
+
+# def evaluate_permutation(perm, tableau, topology):
+#     """Evaluate a permutation, returning both score and metrics"""
+#     pred_iter = iter(perm)
+
+#     def pred_callback(G, remaining, remaining_rows, choice_fn=min):
+#         try:
+#             row, col = next(pred_iter)
+#             if isinstance(row, torch.Tensor):
+#                 row = row.item()
+#             if isinstance(col, torch.Tensor):
+#                 col = col.item()
+
+#             # Check if valid pivot
+#             if (
+#                 hasattr(remaining, "_x_out")
+#                 and remaining._x_out(int(row), int(col)) == 1
+#             ):
+#                 return int(row), int(col)
+#             else:
+#                 raise StopIteration
+#         except StopIteration:
+#             # Safe fallback
+#             for r in remaining_rows:
+#                 for c in range(remaining.n_qubits):
+#                     if remaining._x_out(r, c) == 1:
+#                         return int(r), int(c)
+
+#             if remaining_rows:
+#                 row = min(remaining_rows)
+#                 return int(row), int(row)
+#             else:
+#                 return 0, 0
+
+#     try:
+#         circuit = synthesize_tableau_perm_row_col(
+#             tableau, topology, pick_pivot_callback=pred_callback
+#         )
+#         metrics = collect_circuit_data(circuit)
+#         score = compute_weighted_score(metrics)
+#         return score, metrics
+#     except Exception as e:
+#         # Handle synthesis failures
+#         return float("inf"), {"cx": float("inf"), "depth": float("inf")}
+
+
+import pickle
+import tempfile
+import os
+
+
+def curriculum_train(
+    data_file="training_data_perm.pkl", max_samples=None, epochs_per_stage=10
+):
+    """Curriculum training with staged data"""
+    # Load and preprocess your data
+    all_data = TableauPermutationDataset(
+        data_file=data_file, n_qubits=4, max_samples=max_samples
+    ).data
+    # all_data should be a list of (tableau, best_perms, cx_count)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = OrderedPermutationTransformer(n_qubits=4, dim=256, num_layers=6)
+    # all_data: list of (tableau, best_perms, cx_count)
+    all_data = sorted(all_data, key=lambda x: x[1])  # x[2] = cx_count
+
+    n = len(all_data)
+    stages = [
+        all_data[: n // 4],
+        all_data[n // 4 : n // 2],
+        all_data[n // 2 : 3 * n // 4],
+        all_data[3 * n // 4 :],
+    ]
+
+    for stage_idx, stage_data in enumerate(stages):
+        print(
+            f"Training on curriculum stage {stage_idx+1} with {len(stage_data)} samples"
+        )
+        # Write stage_data to a temporary pickle file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as tmp:
+            pickle.dump(stage_data, tmp)
+            tmp_filename = tmp.name
+
+        dataset = TableauPermutationDataset(tmp_filename)
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=32, shuffle=True, collate_fn=custom_collate_fn
+        )
+        model = train(model, dataloader, epochs=epochs_per_stage, device=device)
+
+        # Clean up the temporary file
+        os.remove(tmp_filename)
+    return model
+
+
 # # Example 1 of usage (without fine-tuning):
-# model = pretrain_a_model_from_file("training_data_perm.pkl", max_samples=320, epochs=20)
+# model = pretrain_a_model_from_file("training_data_perm.pkl", max_samples=320, epochs=10)
+# # model = curriculum_train(
+# #     data_file="training_data_perm.pkl", max_samples=320, epochs_per_stage=5
+# # )
 # circuit = random_hscx_circuit(nr_qubits=4, nr_gates=1000)
 # tableau = tableau_from_circuit(CliffordTableau(4), circuit)
 # # permutations = predict_permutation_gumbel(model, tableau)
 # # permutations = predict_permutation_beam(model, tableau)
 # permutations = entropy_guided_search(model, tableau)
+# # permutations = ensemble_predict_permutation(model, tableau)
+# # permutations = predict_permutation_mcts(model, tableau)
 # print(permutations)
 
 # # Example 2 of usage (with SL fine-tuning):
