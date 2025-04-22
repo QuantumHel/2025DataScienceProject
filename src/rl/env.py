@@ -1,4 +1,4 @@
-from typing import Tuple, Optional, Union, List, Any, Dict
+from typing import Tuple, Optional, Union, List
 import gym
 import networkx as nx
 import numpy as np
@@ -10,153 +10,119 @@ from pauliopt.gates import CX, H, S
 from pauliopt.topologies import Topology
 from pauliopt.utils import is_cutting
 from src.utils import random_hscx_circuit, tableau_from_circuit
-from src.nn.brute_force_data import get_best_cnots
 
-Array3D = np.array
-
-
-def get_optimal_cx_estimate(n_qubits: int) -> int:
-    baseline = {2: 2, 3: 3, 4: 5, 5: 7, 6: 10}
-    return baseline.get(n_qubits, int(round(0.5 * n_qubits * (n_qubits - 1) / 2)))
-
+Array3D = np.ndarray
 
 class CliffordTableauEnv(gym.Env[Tuple[int, int], np.ndarray]):
     def __init__(self, n_qubits: int, nr_gates: int = 1000, topology: Topology = None,
-                 step_penalty=-0.3, final_reward_max=30.0, use_true_cx: bool = False):
+                 cx_penalty: float = -0.5, h_penalty: float = -0.1, s_penalty: float = -0.1,
+                 final_reward: float = 30.0, final_exp_decay: float = 0.3):
         super().__init__()
         self.n_qubits = n_qubits
         self.nr_gates = nr_gates
-        self.step_penalty = step_penalty
-        self.final_reward_max = final_reward_max
-        self.use_true_cx = use_true_cx
-
+        self.cx_penalty = cx_penalty
+        self.h_penalty = h_penalty
+        self.s_penalty = s_penalty
+        self.final_reward = final_reward * (1 + ((self.nr_gates - 5) // 5))
+        self.final_exp_decay = final_exp_decay
         self.topology = topology or Topology.complete(n_qubits)
-        self.graph = self.topology.to_nx
-        self.adjacency_matrix = nx.adjacency_matrix(self.graph).toarray()
-        self.allowed_rows = list(range(n_qubits))
-        self.allowed_cols = list(range(n_qubits))
-        self.clifford_tableau_to_reduce = None
-        self.final_circuit = None
-        self.final_cx = None
-        self.qubits_reduced = 0
 
     def reset(self, **kwargs):
-        circuit = random_hscx_circuit(nr_qubits=self.n_qubits, nr_gates=self.nr_gates)
-        tableau = CliffordTableau(self.n_qubits)
-        tableau = tableau_from_circuit(tableau, circuit)
-        self.clifford_tableau_to_reduce = tableau.inverse()
-        self.final_circuit = Circuit(self.n_qubits)
         self.graph = self.topology.to_nx
         self.adjacency_matrix = nx.adjacency_matrix(self.graph).toarray()
         self.allowed_rows = list(range(self.n_qubits))
         self.allowed_cols = list(range(self.n_qubits))
         self.qubits_reduced = 0
+        self.final_circuit = Circuit(self.n_qubits)
         self.final_cx = None
+
+        circuit = random_hscx_circuit(nr_qubits=self.n_qubits, nr_gates=self.nr_gates)
+        tableau = CliffordTableau(self.n_qubits)
+        self.initial_tableau = tableau_from_circuit(tableau, circuit)
+        self.clifford_tableau_to_reduce = self.initial_tableau.inverse()
 
         return self._get_obs(), self.allowed_rows.copy(), self.allowed_cols.copy()
 
-    def get_true_optimal_cx(self) -> int:
-        best_perm, score = get_best_cnots(self.clifford_tableau_to_reduce.inverse(), self.topology)[0]
-        return score
-
-    def get_current_stats(self) -> float:
+    def get_current_stats(self) -> int:
+        if self.final_cx is not None:
+            return self.final_cx
         return self.final_circuit.to_qiskit().count_ops().get("cx", 0)
-
-    def get_auxiliary_label(self) -> float:
-        if self.final_cx is None:
-            return 0.0
-        optimal = self.get_true_optimal_cx() if self.use_true_cx else get_optimal_cx_estimate(self.n_qubits)
-        delta = self.final_cx - optimal
-        margin = 8
-
-        if delta <= 0:
-            label = 1.0 + (abs(delta) / margin)
-        else:
-            label = max(0.0, 1.0 - (delta / margin))
-
-        return float(np.clip(label, 0.0, 1.2))  # clamp just in case
 
     def step(self, action: Tuple[int, int]):
         pivot_row, pivot_col = action
         assert not is_cutting(pivot_col, self.graph)
 
+        reward = 0.0
         current_circuit = Circuit(self.n_qubits)
 
-        def apply(gate_name: str, gate_data: tuple) -> None:
-            if gate_name == "CNOT":
-                self.clifford_tableau_to_reduce.append_cnot(gate_data[0], gate_data[1])
-                self.final_circuit.add_gate(CX(*gate_data))
-                current_circuit.add_gate(CX(*gate_data))
-            elif gate_name == "H":
-                self.clifford_tableau_to_reduce.append_h(gate_data[0])
-                self.final_circuit.add_gate(H(gate_data[0]))
-                current_circuit.add_gate(H(gate_data[0]))
-            elif gate_name == "S":
-                self.clifford_tableau_to_reduce.append_s(gate_data[0])
-                self.final_circuit.add_gate(S(gate_data[0]))
-                current_circuit.add_gate(S(gate_data[0]))
+        def apply(gate_name: str, args: tuple):
+            gate_cls = {"CNOT": CX, "H": H, "S": S}[gate_name]
+            getattr(self.clifford_tableau_to_reduce, f"append_{gate_name.lower()}")(*args)
+            self.final_circuit.add_gate(gate_cls(*args))
+            current_circuit.add_gate(gate_cls(*args))
 
-        self.allowed_rows.remove(pivot_row)
-        self.allowed_cols.remove(pivot_col)
+        if pivot_row in self.allowed_rows:
+            self.allowed_rows.remove(pivot_row)
+        if pivot_col in self.allowed_cols:
+            self.allowed_cols.remove(pivot_col)
         self.qubits_reduced += 1
+
         steiner_reduce_column(pivot_col, pivot_row, self.graph, self.clifford_tableau_to_reduce, apply)
         self.graph.remove_node(pivot_col)
 
+        # Reward based on gate cost
+        ops = current_circuit.to_qiskit().count_ops()
+        reward += self.cx_penalty * ops.get("cx", 0)
+        reward += self.h_penalty * ops.get("h", 0)
+        reward += self.s_penalty * ops.get("s", 0)
+
         done = self.qubits_reduced >= self.n_qubits
-        if done:
-            final_perm = np.argmax(self.clifford_tableau_to_reduce.x_matrix, axis=1)
-            signs_z = self.clifford_tableau_to_reduce.signs[self.n_qubits:2 * self.n_qubits].copy()
-
-            for col in range(self.n_qubits):
-                if signs_z[col] != 0:
-                    apply("H", (final_perm[col],))
-                    apply("S", (final_perm[col],))
-                    apply("S", (final_perm[col],))
-                    apply("H", (final_perm[col],))
-
-            for col in range(self.n_qubits):
-                if self.clifford_tableau_to_reduce.signs[col] != 0:
-                    apply("S", (final_perm[col],))
-                    apply("S", (final_perm[col],))
-
-        cx_count = current_circuit.to_qiskit().count_ops().get("cx", 0)
-        max_possible_cx = self.n_qubits * (self.n_qubits - 1)
-
-        reward = 3.0 * (1.0 - (cx_count / max_possible_cx) ** 1.2)
-        reward += self.step_penalty
-
+        
         if done:
             self.final_cx = self.final_circuit.to_qiskit().count_ops().get("cx", 0)
-            optimal = self.get_true_optimal_cx() if self.use_true_cx else get_optimal_cx_estimate(self.n_qubits)
-            delta = self.final_cx - optimal
-            margin = 6
+            bonus = self.final_reward * np.exp(-self.final_exp_decay * self.final_cx)
+            curriculum_level = max((self.nr_gates - 5) // 10, 0)
+            curriculum_bonus = curriculum_level * 6.0
+            reward += bonus + curriculum_bonus
+        
+        """
+        if done:
+            self.final_cx = self.final_circuit.to_qiskit().count_ops().get("cx", 0)
 
-            if delta <= 0:
-                # Overachievement bonus: sqrt-based for diminishing returns
-                over_bonus = (abs(delta) + 1) ** 0.5
-                bonus = self.final_reward_max + over_bonus
-            else:
-                # Normal smooth bonus
-                bonus = self.final_reward_max * max(0.0, 1.0 - (delta / margin) ** 1.2)
+            # Smoother final reward (larger values still get rewarded, just less)
+            decay = 0.25  # You can tune this down to 0.2 or up to 0.4
+            smooth_bonus = self.final_reward / (1 + decay * self.final_cx)
 
-            reward += bonus
-
+            # Curriculum bonus — give a small fixed increase every +2 gates
+            curriculum_level = max((self.nr_gates - 5) // 2, 0)
+            curriculum_bonus = curriculum_level * 7.5  # You can try 5.0 → 7.5 → 10.0
+            """
 
         return (self._get_obs(), self.allowed_rows.copy(), self.allowed_cols.copy()), reward, done, {}
 
     def _get_obs(self) -> Array3D:
-        bitmap = np.ones((self.n_qubits, self.n_qubits), dtype=np.float32)
-        for i in range(self.n_qubits):
+        n = self.n_qubits
+
+        bitmap = np.ones((n, n), dtype=np.float32)
+        for i in range(n):
             if i not in self.allowed_rows:
                 bitmap[i, :] = 0.0
             if i not in self.allowed_cols:
                 bitmap[:, i] = 0.0
 
+        x_block = self.clifford_tableau_to_reduce.x_matrix[:n, :n]
+        z_block = self.clifford_tableau_to_reduce.z_matrix[:n, :n]
+        adj_matrix = self.adjacency_matrix.astype(np.float32)
+        signs = self.clifford_tableau_to_reduce.signs[:n].astype(np.float32)
+        sign_map = np.tile(signs[:, np.newaxis], (1, n))
+
+        row_coords = np.tile(np.linspace(0, 1, n).reshape(n, 1), (1, n)).astype(np.float32)
+        col_coords = np.tile(np.linspace(0, 1, n).reshape(1, n), (n, 1)).astype(np.float32)
+        cx_channel = np.full((n, n), np.log1p(self.get_current_stats()), dtype=np.float32)
+
         return np.stack([
-            self.clifford_tableau_to_reduce.x_matrix,
-            self.clifford_tableau_to_reduce.z_matrix,
-            bitmap,
-            self.adjacency_matrix.astype(np.float32)
+            x_block, z_block, bitmap, adj_matrix,
+            sign_map, row_coords, col_coords, cx_channel
         ], axis=0)
 
     def render(self) -> Optional[Union[RenderFrame, List[RenderFrame]]]:

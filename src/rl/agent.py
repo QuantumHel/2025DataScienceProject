@@ -6,7 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from src.rl.env import Array3D, get_optimal_cx_estimate
+from src.rl.env import Array3D
+
+def init_weights(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -27,26 +33,28 @@ def _build_model(n_qubits=4):
             super().__init__()
             self.n_qubits = n_qubits
             self.backbone = nn.Sequential(
-                nn.Conv2d(4, 64, kernel_size=3, padding=1),
+                nn.Conv2d(8, 128, kernel_size=3, padding=1),
                 nn.ReLU(),
-                ResidualBlock(64),
-                ResidualBlock(64),
+                ResidualBlock(128),
+                ResidualBlock(128),
+                ResidualBlock(128),
                 nn.AdaptiveAvgPool2d((n_qubits, n_qubits)),
                 nn.Flatten(),
-                nn.Linear(64 * n_qubits * n_qubits, 256),
+                nn.LayerNorm(128 * n_qubits * n_qubits),
+                nn.Linear(128 * n_qubits * n_qubits, 256),
                 nn.ReLU(),
+                nn.Dropout(p=0.2),
             )
             self.control_head = nn.Linear(256, n_qubits)
             self.target_head = nn.Linear(256, n_qubits)
-            self.aux_head = nn.Linear(256, 1)
+            self.apply(init_weights)
 
         def forward(self, x):
             features = self.backbone(x)
             control_q = self.control_head(features)
             target_q = self.target_head(features)
             q_matrix = torch.einsum("bi,bj->bij", control_q, target_q)
-            optimality_score = torch.sigmoid(self.aux_head(features))
-            return q_matrix, optimality_score
+            return q_matrix
 
     return CNNFactorizedQNet(n_qubits)
 
@@ -59,16 +67,18 @@ class DQNAgent:
         self.target_model.eval()
 
         self.memory = deque(maxlen=20000)
-        self.n_step_buffer = deque(maxlen=3)
+        self.archive = deque(maxlen=100)  # Top-performing episodes
+        self.episode_buffer = []
 
         self.gamma = config["gamma"]
-        self.epsilon = 1.0
+        self.epsilon = config.get("epsilon_start", 1.0)
         self.epsilon_min = config["epsilon_min"]
         self.epsilon_decay = config["epsilon_decay"]
         self.learning_rate = config["learning_rate"]
         self.gradient_clip_norm = config["gradient_clip_norm"]
+        self.reward_clip = config.get("reward_clip", 20.0)
         self.n_qubits = n_qubits
-        self.aux_weight = config.get("aux_loss_weight", 0.25)
+        self.k_explore = config.get("top_k", 5)
 
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.losses = []
@@ -76,75 +86,88 @@ class DQNAgent:
     def update_target_network(self):
         self.target_model.load_state_dict(self.model.state_dict())
 
-    def remember(self, state, action, reward, next_state, done, final_cx=None):
-        aux_label = 0.0
-        if done and final_cx is not None:
-            optimal = get_optimal_cx_estimate(self.n_qubits)
-            margin = 8
-            diff = final_cx - optimal
-            if diff <= 0:
-                aux_label = 1.0 + (abs(diff) / margin)
-            else:
-                aux_label = max(0.0, 1.0 - (diff / margin))
+    def remember(self, state, action, reward, next_state, done):
+        self.episode_buffer.append((state, action, reward, next_state, done))
 
-            aux_label = float(np.clip(aux_label, 0.0, 1.2))  # clamp just in case
+    def remember_episode(self, done: bool):
+        if done:
+            self.memory.extend(self.episode_buffer)
 
-        self.n_step_buffer.append((state, action, reward, next_state, done, aux_label))
-        if len(self.n_step_buffer) == self.n_step_buffer.maxlen:
-            R = sum([(self.gamma ** i) * self.n_step_buffer[i][2] for i in range(len(self.n_step_buffer))])
-            s0, a0 = self.n_step_buffer[0][:2]
-            s_next, d_last = self.n_step_buffer[-1][3], self.n_step_buffer[-1][4]
-            final_label = self.n_step_buffer[-1][5]
-            self.memory.append((s0, a0, R, s_next, d_last, final_label))
+            try:
+                cx_val = self.episode_buffer[-1][3][0][-1, 0, 0]  # cx_channel[0, 0] from last next_state
+                if len(self.archive) < self.archive.maxlen or cx_val < max(
+                    x[-1][3][0][-1, 0, 0] for x in self.archive
+                ):
+                    self.archive.append(list(self.episode_buffer))
+            except Exception:
+                pass
 
-    def act(self, state: Array3D, allowed_rows: list, allowed_cols: list) -> Tuple[int, int]:
-        if np.random.rand() <= self.epsilon:
+        self.episode_buffer.clear()
+
+    def act(self, state: Array3D, allowed_rows: list, allowed_cols: list, explore: bool = True) -> Tuple[int, int]:
+        if explore and np.random.rand() <= self.epsilon:
             return random.choice(allowed_rows), random.choice(allowed_cols)
 
         with torch.no_grad():
             input_tensor = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
-            q_values, _ = self.model(input_tensor)
-            q_values = q_values[0].cpu()
+            q_values = self.model(input_tensor)[0].cpu()
 
-        allowed_q_values = q_values[allowed_rows][:, allowed_cols]
-        best_idx = torch.argmax(allowed_q_values).item()
-        row_idx, col_idx = divmod(best_idx, allowed_q_values.size(1))
-        return allowed_rows[row_idx], allowed_cols[col_idx]
+        mask = torch.full((self.n_qubits, self.n_qubits), float('-inf'))
+        for r in allowed_rows:
+            for c in allowed_cols:
+                mask[r, c] = q_values[r, c]
+
+        if explore:
+            flat_values = mask.flatten()
+            topk = min(self.k_explore, len(allowed_rows) * len(allowed_cols))
+            topk_indices = torch.topk(flat_values, topk).indices
+            topk_values = flat_values[topk_indices]
+            probs = torch.softmax(topk_values, dim=0).numpy()
+            chosen_idx = np.random.choice(topk_indices.numpy(), p=probs)
+        else:
+            chosen_idx = torch.argmax(mask).item()
+
+        row_idx, col_idx = divmod(chosen_idx, self.n_qubits)
+        return row_idx, col_idx
 
     def replay(self, batch_size):
-        minibatch = random.sample(self.memory, batch_size)
-        state_batch, action_batch, targets, labels = [], [], [], []
+        if len(self.memory) < batch_size:
+            return
 
-        for s, a, r, s_next, done, aux_label in minibatch:
-            state_tensor = torch.from_numpy(s[0]).float().to(self.device)
-            next_tensor = torch.from_numpy(s_next[0]).float().unsqueeze(0).to(self.device)
+        primary_batch = random.sample(self.memory, int(batch_size * 0.8))
+        archive_batch = []
+        if self.archive:
+            for ep in random.sample(list(self.archive), min(len(self.archive), batch_size - len(primary_batch))):
+                archive_batch.append(random.choice(ep))
+
+        batch = primary_batch + archive_batch
+        states, actions, targets = [], [], []
+
+        for s, a, r, s_next, done in batch:
+            s_tensor = torch.from_numpy(s[0]).float().to(self.device)
+            s_next_tensor = torch.from_numpy(s_next[0]).float().unsqueeze(0).to(self.device)
 
             with torch.no_grad():
-                q_online, _ = self.model(next_tensor)
-                q_target, _ = self.target_model(next_tensor)
-                best_action = torch.argmax(q_online.view(-1)).item()
-                best_row = best_action // self.n_qubits
-                best_col = best_action % self.n_qubits
-                max_q = q_target[0, best_row, best_col].item()
+                q_next = self.target_model(s_next_tensor)
+                best_action = torch.argmax(q_next.view(-1)).item()
+                max_q = q_next[0].view(-1)[best_action]
 
-            y = r if done else r + self.gamma * max_q
-            state_batch.append(state_tensor)
-            action_batch.append(a)
+            y = r if done else r + self.gamma * max_q.item()
+            y = np.clip(y, -self.reward_clip, self.reward_clip)
+
+            states.append(s_tensor)
+            actions.append(a)
             targets.append(y)
-            labels.append(float(np.clip(aux_label, 0.0, 1.0)))
 
-        state_batch = torch.stack(state_batch).to(self.device)
+        states = torch.stack(states)
+        actions = torch.tensor(actions).long().to(self.device)
         targets = torch.tensor(targets).float().to(self.device)
-        labels = torch.tensor(labels).float().to(self.device)
-        action_indices = torch.tensor(action_batch).long().to(self.device)
 
-        q_pred, opt_pred = self.model(state_batch)
-        b_idx = torch.arange(len(minibatch))
-        q_values = q_pred[b_idx, action_indices[:, 0], action_indices[:, 1]]
+        q_pred = self.model(states)
+        q_vals = q_pred[torch.arange(len(states)), actions[:, 0], actions[:, 1]]
 
-        loss_q = F.huber_loss(q_values, targets)
-        loss_aux = F.binary_cross_entropy(opt_pred.squeeze(), labels)
-        loss = loss_q + self.aux_weight * loss_aux
+        # loss = F.mse_loss(q_vals, targets) # Loss function for base model training with lower reward scheme
+        loss = F.smooth_l1_loss(q_vals, targets) # Loss function for base model training with sharp rewards
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -152,5 +175,4 @@ class DQNAgent:
         self.optimizer.step()
 
         self.losses.append(loss.item())
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)

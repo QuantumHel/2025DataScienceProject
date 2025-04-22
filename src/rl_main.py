@@ -8,64 +8,100 @@ from src.rl.agent import DQNAgent
 from src.rl.env import CliffordTableauEnv
 
 CONFIG = {
-    "learning_rate": 3e-4,
-    "batch_size": 32,
-    "epsilon_decay": 0.999,
-    "epsilon_min": 0.005,
-    "gamma": 0.995,
-    "gradient_clip_norm": 10.0,
-    "step_penalty": -0.3,
-    "final_reward_max": 60.0,
-    "target_update_interval": 3,
-    "replay_start_size": 256,
-    "replay_every_n_steps": 1,
-    "n_episodes": 100000,
-    "moving_avg_window": 200,
-    "aux_loss_weight": 0.4,
-    "curriculum_episodes": 1000  # <- curriculum phase length
+    "learning_rate": 0.00005,
+    "batch_size": 64,
+    "epsilon_start": 0,
+    "epsilon_min": 0.00,
+    "epsilon_decay": 0.99995,
+    "gamma": 0.99,
+    "gradient_clip_norm": 1.0,
+
+    # Reward structure
+    "cx_penalty": -10,
+    "h_penalty": -1,
+    "s_penalty": -1,
+    "final_reward": 500.0,
+
+    # Target network & replay
+    "target_update_interval": 20,
+    "replay_every_n_steps": 4,
+
+    # Logging & training
+    "n_episodes": 200000,
+    "moving_avg_window": 50,
+
+    # Loss weight placeholders (unused currently but kept if needed later)
+    "aux_loss_weight": 0.2,
+    "cx_loss_weight": 3.0,
+
+    # Exploration control
+    "top_k": 1,
+
+    # Curriculum learning
+    "use_curriculum": True,
+    "curriculum_start_gates": 5,
+    "curriculum_step": 2,
+    "curriculum_max_gates": 1000
 }
+
+def save_checkpoint(agent, episode, best_cx, path):
+    torch.save({
+        "model_state_dict": agent.model.state_dict(),
+        "target_model_state_dict": agent.target_model.state_dict(),
+        "optimizer_state_dict": agent.optimizer.state_dict(),
+        "epsilon": agent.epsilon,
+        "losses": agent.losses,
+        "episode": episode,
+        "config": CONFIG,
+        "best_cx": best_cx
+    }, path)
+    plt.savefig("models/best_model_plot.png")
+    with open("models/best_model_log.txt", "w") as f:
+        f.write(f"Best model at episode {episode} with avg CX count {best_cx:.4f}\n")
 
 def load_checkpoint(agent, path):
     checkpoint = torch.load(path)
     agent.model.load_state_dict(checkpoint["model_state_dict"])
     agent.target_model.load_state_dict(checkpoint["target_model_state_dict"])
     agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    agent.epsilon = checkpoint["epsilon"]
+    agent.epsilon = CONFIG["epsilon_start"]
     agent.losses = checkpoint["losses"]
-    return checkpoint["episode"]
+    return checkpoint["episode"], checkpoint.get("best_cx", float("inf"))
 
 def main():
-    resume_training = True  # Set to False to start fresh with the training, true to resume from best model
-    checkpoint_path = "models/best_model.pt"
-    start_episode = 0
-
+    resume_training = True
+    checkpoint_path = "models/super_optimized_model_nrgates_5.pt"
+    start_episode = 100000
+    
     n_qubits = 4
-    n_gates = 100
-    curriculum_episodes = CONFIG["curriculum_episodes"]
+    current_gates = CONFIG["curriculum_start_gates"]
 
     env = CliffordTableauEnv(
-        n_qubits = n_qubits,
-        nr_gates = n_gates,
-        step_penalty = CONFIG["step_penalty"],
-        final_reward_max = CONFIG["final_reward_max"],
-        use_true_cx = False  # <--- explicitly disable true CX bonus
+        n_qubits=n_qubits,
+        nr_gates=current_gates,
+        cx_penalty=CONFIG["cx_penalty"],
+        h_penalty=CONFIG["h_penalty"],
+        s_penalty=CONFIG["s_penalty"],
+        final_reward=CONFIG["final_reward"]
     )
     agent = DQNAgent(n_qubits=n_qubits, config=CONFIG)
 
     if resume_training and os.path.exists(checkpoint_path):
-        start_episode = load_checkpoint(agent, checkpoint_path)
-        print(f"Resuming training from episode {start_episode}")
-        if start_episode >= CONFIG["curriculum_episodes"]: CONFIG["curriculum_episodes"] = -1
-
-    os.makedirs("models", exist_ok=True)
-    best_cx = float("inf")
+        start_episode, best_cx = load_checkpoint(agent, checkpoint_path)
+        print(f"Resuming training from episode {start_episode} with best CX {best_cx:.4f}")
+    else:
+        best_cx = float("inf")
 
     scores_episode, rewards_episode = [], []
     moving_avg_scores, moving_avg_rewards = [], []
 
+    best_cx = float("inf")
+    previous_gates = current_gates
+    curriculum_episode_threshold = 15000  # Start with 2500 episodes
+    next_curriculum_update = curriculum_episode_threshold
+
     plt.ion()
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-
     ax1.set_title("#CX over Episodes")
     ax1.set_xlabel("Episodes")
     ax1.set_ylabel("#CX")
@@ -94,85 +130,70 @@ def main():
         ax2.relim(); ax2.autoscale_view()
         plt.draw(); plt.pause(0.01)
 
-    progress = trange(start_episode, CONFIG["n_episodes"], desc="Training", dynamic_ncols=True)
+    progress = trange(CONFIG["n_episodes"], desc="Training", dynamic_ncols=True)
     for episode in progress:
+        if CONFIG["use_curriculum"] and episode >= next_curriculum_update:
+            new_gates = min(current_gates + CONFIG["curriculum_step"], CONFIG["curriculum_max_gates"])
+            if new_gates != current_gates:
+                current_gates = new_gates
+                agent.epsilon = CONFIG["epsilon_start"] * 0.5
+                curriculum_episode_threshold = int(curriculum_episode_threshold * 1)
+                next_curriculum_update = episode + curriculum_episode_threshold
+
+        env.nr_gates = current_gates
+
         state = env.reset()
         done = False
-        total_reward, step_count = 0.0, 0
+        total_reward = 0
+        step_count = 0
 
         while not done:
-            action = agent.act(*state)
+            action = agent.act(*state, explore=True)
             next_state, reward, done, _ = env.step(action)
-            final_cx = env.final_cx if done else None
-            agent.remember(state, action, reward, next_state, done, final_cx)
+            agent.remember(state, action, reward, next_state, done)
             state = next_state
-            step_count += 1
             total_reward += reward
+            step_count += 1
 
-            if len(agent.memory) > CONFIG["replay_start_size"] and step_count % CONFIG["replay_every_n_steps"] == 0:
+            if len(agent.memory) >= CONFIG["batch_size"] and step_count % CONFIG["replay_every_n_steps"] == 0:
                 agent.replay(CONFIG["batch_size"])
 
-        cx_count = env.get_current_stats() if done else -1
+        agent.remember_episode(done)
+
+        cx_count = env.get_current_stats()
         scores_episode.append(cx_count)
         rewards_episode.append(total_reward)
 
-        if episode == curriculum_episodes:
-            print(f"Curriculum phase done at episode {episode}. Clearing replay buffer.")
-            agent.memory.clear()
-            agent.n_step_buffer.clear()
+        ma_cx = np.mean(scores_episode[-CONFIG["moving_avg_window"]:])
+        ma_reward = np.mean(rewards_episode[-CONFIG["moving_avg_window"]:])
+        moving_avg_scores.append(ma_cx)
+        moving_avg_rewards.append(ma_reward)
 
-        # Update moving averages
-        if len(scores_episode) >= CONFIG["moving_avg_window"]:
-            moving_avg_scores.append(np.mean(scores_episode[-CONFIG["moving_avg_window"]:]))
-            moving_avg_rewards.append(np.mean(rewards_episode[-CONFIG["moving_avg_window"]:]))
-        else:
-            moving_avg_scores.append(np.mean(scores_episode))
-            moving_avg_rewards.append(np.mean(rewards_episode))
-
-        # Log
-        if episode % 10 == 0 and agent.losses:
-            progress.write(f"Episode {episode}: Loss={np.mean(agent.losses[-10:]):.4f}, "
-                           f"Reward={moving_avg_rewards[-1]:.2f}, CX={moving_avg_scores[-1]:.2f}")
+        if episode % 50 == 0:
+            avg_loss = np.nanmean(agent.losses[-10:]) if agent.losses else float("nan")
+            progress.write(
+                f"Ep {episode} | Reward={ma_reward:.2f}, "
+                f"Eps={agent.epsilon:.3f}, "
+                f"Loss={avg_loss:.4f}, "
+                f"CX_MA={ma_cx:.2f}, CX={cx_count}, Gates={env.nr_gates}"
+            )
 
         if episode % CONFIG["target_update_interval"] == 0:
             agent.update_target_network()
 
-        if episode % 5 == 0:
+        if episode % 25 == 0:
             update_plot()
 
-        if episode >= 1000 and moving_avg_scores[-1] < best_cx:
-            best_cx = moving_avg_scores[-1]
-            best_episode = episode
+        if ma_cx < best_cx:
+            best_cx = ma_cx
+            save_checkpoint(agent, episode, best_cx, "models/best_model.pt")
 
-            model_path = "models/best_model.pt"
-            plot_path = "models/best_model_plot.png"
-            log_path = "models/best_model_log.txt"
+        if episode % 1000 == 0:
+            save_checkpoint(agent, episode, ma_cx, f"models/checkpoint_ep_ft_{episode}.pt")
 
-            torch.save({
-                "model_state_dict": agent.model.state_dict(),
-                "target_model_state_dict": agent.target_model.state_dict(),
-                "optimizer_state_dict": agent.optimizer.state_dict(),
-                "epsilon": agent.epsilon,
-                "losses": agent.losses,
-                "episode": episode,
-                "config": CONFIG
-            }, model_path)
-            plt.tight_layout()
-            plt.savefig(plot_path)
-
-            with open(log_path, "w") as f:
-                f.write(f"Best model at episode {episode} with avg CX count {best_cx:.4f}\n")
-
-    torch.save(agent.model.state_dict(), model_path)
-    plt.tight_layout()
-    plt.savefig(plot_path)
-
-    plt.ioff()
-    plt.tight_layout()
     plt.savefig("dqn_agent_trends.png")
-    plt.show()
-
-    print(f"Training finished. Best CX achieved: {best_cx}")
+    plt.ioff(); plt.show()
+    print(f"Training finished. Best CX achieved: {best_cx:.4f}")
 
 if __name__ == "__main__":
     main()
