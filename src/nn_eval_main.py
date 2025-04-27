@@ -20,7 +20,7 @@ from src.utils import random_hscx_circuit, tableau_from_circuit
 np.seterr(over='ignore')
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-model_path = "models/best_model.pt"
+model_path = "models/finetuned_from_base_nrgates_21.pt"
 checkpoint = torch.load(model_path, map_location=torch.device("cpu"))
 CONFIG = checkpoint["config"]
 
@@ -29,6 +29,14 @@ agent = DQNAgent(n_qubits=n_qubits, config=CONFIG)
 agent.model.load_state_dict(checkpoint["model_state_dict"])
 agent.model.eval()
 agent.epsilon = 0.0
+
+def pretty_print_circuit(circuit):
+    """Pretty print the circuit."""
+    print("Circuit:")
+    for gate in circuit.gates:
+        gate_type = gate.__class__.__name__
+        qubits = ", ".join(str(q) for q in gate.qubits)
+        print(f"  {gate_type} on qubit(s): {qubits}")
 
 def collect_circuit_data(circuit: Circuit) -> dict:
     circuit.final_permutation = None
@@ -64,6 +72,7 @@ def optimal_compilation(circuit: Circuit, topology: Topology, n_rep: int):
     return {"n_rep": n_rep, "method": "optimum", **collect_circuit_data(circ_out)}
 
 def rl_compilation(circuit: Circuit, topology: Topology, n_rep: int):
+    """Use the RL agent to compile the circuit."""
     tableau = tableau_from_circuit(CliffordTableau(circuit.n_qubits), circuit)
     env = CliffordTableauEnv(
         n_qubits=circuit.n_qubits,
@@ -94,20 +103,59 @@ def rl_compilation(circuit: Circuit, topology: Topology, n_rep: int):
     circ_out = synthesize_tableau_perm_row_col(tableau, topology, pick_pivot_callback=pick_pivot)
     return {"n_rep": n_rep, "method": "rl_model", **collect_circuit_data(circ_out)}
 
-def main(n_qubits: int = 4, nr_gates: int = 5):
+def main(n_qubits: int = 4, nr_gates: int = 20):
     df = pd.DataFrame(columns=["n_rep", "num_qubits", "method", "h", "s", "cx", "depth"])
     topology = Topology.complete(n_qubits)
 
-    for i in range(1000):
+    # Initialize confusion matrix-like structure for RL vs. Optimum scores
+    confusion_matrix = pd.DataFrame()   
+
+    for i in range(100):
         print(f"Iteration {i}")
         circuit = random_hscx_circuit(nr_qubits=n_qubits, nr_gates=nr_gates)
 
+        # Store scores for each method
+        method_scores = {}
         for method_fn in [our_compilation, optimal_compilation, random_compilation, rl_compilation]:
             row = method_fn(circuit.copy(), topology, i)
             df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-            print(f"{row['method']} CX: {row['cx']}")
+            method_scores[row["method"]] = row["cx"]
+            print(f"{row['method']}: {row['cx']}", end=" | ")
         print("\n")
+
+        # Compare RL score to the optimum score
+        rl_score = method_scores["rl_model"]
+        optimum_score = method_scores["optimum"]
+
+        # Update confusion matrix-like structure
+        if optimum_score not in confusion_matrix.index:
+            # Add a new row for the optimum score, initializing all columns to 0
+            confusion_matrix = pd.concat(
+                [confusion_matrix, pd.DataFrame([[0] * len(confusion_matrix.columns)], index=[optimum_score])],
+                axis=0
+            )
+        if rl_score not in confusion_matrix.columns:
+            # Add a new column for the RL score, initializing all rows to 0
+            confusion_matrix[rl_score] = 0
+        confusion_matrix.loc[optimum_score, rl_score] += 1
+
+        # Print circuit if RL score is +5 worse than optimum
+        score_diff = rl_score - optimum_score
+        #if score_diff >= 5:
+            #print(f"RL score is significantly worse (+{score_diff}) than optimum. Circuit:")
+            #pretty_print_circuit(circuit)
+
+    # Save results to CSV
     df.to_csv("test_clifford_synthesis.csv", index=False)
+
+    # Print confusion matrix
+    print("\nConfusion Matrix (Optimum vs RL Scores):")
+    confusion_matrix = confusion_matrix.sort_index(axis=0).sort_index(axis=1)
+    confusion_matrix = confusion_matrix.fillna(0)
+    print(confusion_matrix)
+
+    # Print mean scores grouped by method
+    print("\nMean Scores by Method:")
     print(df.groupby("method").mean())
 
 if __name__ == "__main__":

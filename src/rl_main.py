@@ -9,7 +9,7 @@ from src.rl.env import CliffordTableauEnv
 
 CONFIG = {
     "learning_rate": 0.00005,
-    "batch_size": 64,
+    "batch_size": 128,
     "epsilon_start": 0,
     "epsilon_min": 0.00,
     "epsilon_decay": 0.99995,
@@ -17,9 +17,9 @@ CONFIG = {
     "gradient_clip_norm": 1.0,
 
     # Reward structure
-    "cx_penalty": -10,
-    "h_penalty": -1,
-    "s_penalty": -1,
+    "cx_penalty": -1,
+    "h_penalty": 0,
+    "s_penalty": 0,
     "final_reward": 500.0,
 
     # Target network & replay
@@ -70,8 +70,8 @@ def load_checkpoint(agent, path):
 
 def main():
     resume_training = True
-    checkpoint_path = "models/super_optimized_model_nrgates_5.pt"
-    start_episode = 100000
+    checkpoint_path = "models/finetuned_from_base_nrgates_21.pt"
+    start_episode = 0
     
     n_qubits = 4
     current_gates = CONFIG["curriculum_start_gates"]
@@ -97,7 +97,7 @@ def main():
 
     best_cx = float("inf")
     previous_gates = current_gates
-    curriculum_episode_threshold = 15000  # Start with 2500 episodes
+    curriculum_episode_threshold = 5000
     next_curriculum_update = curriculum_episode_threshold
 
     plt.ion()
