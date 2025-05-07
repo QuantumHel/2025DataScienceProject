@@ -34,6 +34,16 @@ np.seterr(over="ignore")
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
+def get_default_device():
+    """Return the best available device (CUDA → MPS → CPU)"""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
 # Try a Block-Aware Residual Encoder (Expect to be better for Tableau Structure, but in fact not)
 class ResidualBlockAwareEncoder(nn.Module):
     def __init__(self, n_qubits):
@@ -212,8 +222,8 @@ class PermutationCXAwareDecoder(nn.Module):
         # CX-aware attention mechanism
         self.cx_attention = nn.Linear(dim, n_qubits**2)
 
-        # Direct CX estimation per permutation element
-        self.element_cx_impact = nn.Parameter(torch.zeros(n_qubits, n_qubits))
+        # # Direct CX estimation per permutation element (unused)
+        # self.element_cx_impact = nn.Parameter(torch.zeros(n_qubits, n_qubits))
 
         # Final CX integration layer
         self.cx_integration = nn.Sequential(
@@ -572,6 +582,9 @@ class OrderedPermutationLoss(nn.Module):
                         : preds[i].size(0)
                     ]  # Truncate if too long
 
+                # Ensure device matching
+                valid_seq_padded = valid_seq_padded.to(preds[i].device)
+
                 # # Try adding label smoothing (the model is stuck at loss 170.0)
                 # smoothing = 0.1
                 # valid_seq_padded = valid_seq_padded * (1 - smoothing) + smoothing / n
@@ -665,7 +678,7 @@ class OrderedPermutationLoss(nn.Module):
         )
 
 
-def train(model, dataloader, epochs=100, device=None):
+def train(model, dataloader, epochs, device):
     # Initialization
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
@@ -916,10 +929,17 @@ def pad_targets_all_seq(raw_targets, device):
 
 
 class TableauPermutationDataset(Dataset):
-    def __init__(self, data_file, n_qubits=4, max_samples=None, shuffle=True):
+    def __init__(self, data_file, n_qubits=None, max_samples=None, shuffle=True):
         print(f"Loading data from {data_file}...")
         with open(data_file, "rb") as f:
             all_data = pickle.load(f)
+
+        # Detect n_qubits from the first tableau in the dataset
+        if n_qubits is None and all_data:
+            self.n_qubits = all_data[0][0].n_qubits
+            print(f"Auto-detected {self.n_qubits} qubits from data")
+        else:
+            self.n_qubits = n_qubits
 
         # Option to load only a subset
         if max_samples is not None and max_samples < len(all_data):
@@ -934,8 +954,6 @@ class TableauPermutationDataset(Dataset):
         else:
             self.data = all_data
             print(f"Loaded all {len(self.data)} training examples")
-
-        self.n_qubits = n_qubits
 
     def __len__(self):
         return len(self.data)
@@ -1064,17 +1082,14 @@ def custom_collate_fn(batch):
     return tableaus, targets
 
 
-def pretrain_a_model_from_file(
-    data_file="training_data_perm.pkl", max_samples=None, epochs=30
-):
-    n_qubits = 4
-    # model = OrderedPermutationTransformer(n_qubits=n_qubits)
-    model = OrderedPermutationTransformer(
-        n_qubits=4, dim=256, num_layers=12
-    )  # Try wider model 6 -> 12
+def pretrain_a_model_from_file(data_file, max_samples, epochs, device):
     dataset = TableauPermutationDataset(
-        data_file, n_qubits=n_qubits, max_samples=max_samples
+        data_file, n_qubits=None, max_samples=max_samples
     )
+    # model = OrderedPermutationTransformer(n_qubits=dataset.n_qubits)
+    model = OrderedPermutationTransformer(
+        n_qubits=dataset.n_qubits, dim=256, num_layers=12
+    )  # Try wider model 6 -> 12
 
     # Use standard PyTorch DataLoader with custom collate function
     dataloader = torch.utils.data.DataLoader(
@@ -1084,11 +1099,11 @@ def pretrain_a_model_from_file(
         collate_fn=custom_collate_fn,
     )
 
-    # Auto-detect device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # # Auto-detect device
+    # # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # train(model, dataloader, epochs=10, device=device)
     train(
-        model, dataloader, epochs=epochs, device=device
+        model, dataloader, epochs, device
     )  # 100 epochs too much, plateau at 50; well, 50 epochs seem too much too
     return model
 
@@ -1237,7 +1252,7 @@ def convert_tensor_to_tableau(tableau_tensor):
 
 
 # Ready to use, but no big improvement as expected! So, did not used mostly.
-def supervised_cx_fine_tune(model, dataset, epochs=5, device="cpu"):
+def supervised_cx_fine_tune(model, dataset, epochs, device):
     """Fine-tune with supervised learning focusing on CX reduction"""
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
@@ -1563,7 +1578,7 @@ def compute_weighted_score(pred_metrics):
 #     return cx_weight * pred_metrics["cx"] + depth_weight * pred_metrics["depth"]
 
 
-def predict_permutation(model, clifford_tableau, device="cpu"):
+def predict_permutation(model, clifford_tableau, device):
     """Returns the best permutation after evaluating multiple candidates"""
     device = torch.device(device)
     model = model.to(device)
@@ -1710,7 +1725,7 @@ def tiny_gumbel_sinkhorn(logits, temp=1.0, n_iters=20):
     return torch.exp(noisy_logits)
 
 
-def predict_permutation_gumbel(model, clifford_tableau, device="cpu"):
+def predict_permutation_gumbel(model, clifford_tableau, device):
     """Returns the best permutation after evaluating multiple candidates"""
     device = torch.device(device)
     model = model.to(device)
@@ -1942,7 +1957,7 @@ def predict_permutation_beam(model, clifford_tableau, device="cpu", beam_width=5
             return [[(i, i) for i in range(n_qubits)]]
 
 
-def entropy_guided_search(model, clifford_tableau, device="cpu", n_samples=5):
+def entropy_guided_search(model, clifford_tableau, device, n_samples=5):
     """Focus search on areas where model is uncertain to find better permutations"""
     device = torch.device(device)
     model = model.to(device)
@@ -2072,7 +2087,7 @@ def entropy_guided_search(model, clifford_tableau, device="cpu", n_samples=5):
         return [best_perm]  # Keep list format for compatibility
 
 
-def ensemble_predict_permutation(model, tableau, device="cpu"):
+def ensemble_predict_permutation(model, tableau, device):
     """Run multiple permutation prediction strategies and select best result"""
     candidates = []
 
@@ -2699,17 +2714,25 @@ import tempfile
 import os
 
 
-def curriculum_train(
-    data_file="training_data_perm.pkl", max_samples=None, epochs_per_stage=10
-):
+def curriculum_train(data_file, max_samples, epochs_per_stage, device):
     """Curriculum training with staged data"""
     # Load and preprocess your data
     all_data = TableauPermutationDataset(
-        data_file=data_file, n_qubits=4, max_samples=max_samples
-    ).data
+        data_file=data_file, n_qubits=None, max_samples=max_samples
+    )
     # all_data should be a list of (tableau, best_perms, cx_count)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = OrderedPermutationTransformer(n_qubits=4, dim=256, num_layers=6)
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Check for CUDA first, then MPS, then fall back to CPU
+    # if torch.cuda.is_available():
+    #     device = torch.device("cuda")
+    # elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    #     device = torch.device("mps")
+    # else:
+    #     device = torch.device("cpu")
+    model = OrderedPermutationTransformer(
+        n_qubits=all_data.n_qubits, dim=256, num_layers=6
+    )
+    all_data = all_data.data
     # all_data: list of (tableau, best_perms, cx_count)
     all_data = sorted(all_data, key=lambda x: x[1])  # x[2] = cx_count
 
@@ -2734,7 +2757,7 @@ def curriculum_train(
         dataloader = torch.utils.data.DataLoader(
             dataset, batch_size=32, shuffle=True, collate_fn=custom_collate_fn
         )
-        model = train(model, dataloader, epochs=epochs_per_stage, device=device)
+        model = train(model, dataloader, epochs_per_stage, device)
 
         # Clean up the temporary file
         os.remove(tmp_filename)
@@ -2742,16 +2765,20 @@ def curriculum_train(
 
 
 # # Example 1 of usage (without fine-tuning):
-# model = pretrain_a_model_from_file("training_data_perm.pkl", max_samples=320, epochs=10)
+# device = get_default_device()
+# print(f"Using device: {device}")
+# device = "cpu"
+# n_qubit = 5
+# model = pretrain_a_model_from_file("training_data_perm_5_qubit.pkl", 320, 10, device)
 # # model = curriculum_train(
 # #     data_file="training_data_perm.pkl", max_samples=320, epochs_per_stage=5
 # # )
-# circuit = random_hscx_circuit(nr_qubits=4, nr_gates=1000)
-# tableau = tableau_from_circuit(CliffordTableau(4), circuit)
-# # permutations = predict_permutation_gumbel(model, tableau)
+# circuit = random_hscx_circuit(nr_qubits=n_qubit, nr_gates=1000)
+# tableau = tableau_from_circuit(CliffordTableau(n_qubit), circuit)
+# permutations = predict_permutation_gumbel(model, tableau, device)
 # # permutations = predict_permutation_beam(model, tableau)
-# permutations = entropy_guided_search(model, tableau)
-# # permutations = ensemble_predict_permutation(model, tableau)
+# # permutations = entropy_guided_search(model, tableau, device)
+# # permutations = ensemble_predict_permutation(model, tableau, device)
 # # permutations = predict_permutation_mcts(model, tableau)
 # print(permutations)
 

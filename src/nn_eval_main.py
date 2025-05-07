@@ -40,7 +40,13 @@ from src.nn.permutation_math import (
     entropy_guided_search,
     ensemble_predict_permutation,
     curriculum_train,
+    get_default_device,
 )
+
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 
 # Suppress all overflow warnings globally
 np.seterr(over="ignore")
@@ -144,13 +150,14 @@ def dummy_perm_compilation(
     topology: Topology,
     n_rep: int,
     model: OrderedPermutationTransformer,
+    device,
 ):
     clifford_tableau = CliffordTableau(circuit.n_qubits)
     clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
-    # best_permutation = predict_permutation_gumbel(model, clifford_tableau)
-    # best_permutation = predict_permutation_beam(model, clifford_tableau)
-    best_permutation = entropy_guided_search(model, clifford_tableau)
-    # best_permutation = ensemble_predict_permutation(model, clifford_tableau)
+    best_permutation = predict_permutation_gumbel(model, clifford_tableau, device)
+    # best_permutation = predict_permutation_beam(model, clifford_tableau, device)
+    # best_permutation = entropy_guided_search(model, clifford_tableau, device)
+    # best_permutation = ensemble_predict_permutation(model, clifford_tableau, device)
     best_permutation = iter(best_permutation[0])
 
     def pick_pivot_callback(
@@ -165,7 +172,74 @@ def dummy_perm_compilation(
     return {"n_rep": n_rep} | collect_circuit_data(circ_out) | {"method": "dummy-perm"}
 
 
-def main(n_qubits: int = 4, nr_gates: int = 1000):
+def add_cx_trend_plot(df):
+    # Set up the plot style
+    plt.figure(figsize=(12, 7))
+    sns.set_style("whitegrid")
+
+    # Get data for each method
+    methods = ["normal_heuristic", "dummy-perm", "combined_min", "optimum"]
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+    labels = ["Standard Heuristic", "Neural Network", "Combined Method", "Optimum"]
+
+    # for method, color, label in zip(methods, colors, labels):
+    #     # Extract data for this method
+    #     method_df = df[df["method"] == method].sort_values("n_rep")
+
+    #     # Plot CX count trend
+    #     plt.plot(
+    #         method_df["n_rep"], method_df["cx"], color=color, alpha=0.7, label=label
+    #     )
+
+    #     # Add rolling average for clarity
+    #     rolling_avg = method_df["cx"].rolling(window=50, min_periods=1).mean()
+    #     plt.plot(method_df["n_rep"], rolling_avg, color=color, linewidth=2.5)
+
+    for method, color, label in zip(methods, colors, labels):
+        # Extract data for this method
+        method_df = df[df["method"] == method].sort_values("n_rep")
+
+        # Calculate rolling statistics
+        rolling_avg = method_df["cx"].rolling(window=50, min_periods=1).mean()
+        rolling_std = method_df["cx"].rolling(window=50, min_periods=1).std()
+
+        # Plot the mean line
+        plt.plot(
+            method_df["n_rep"], rolling_avg, color=color, linewidth=2.5, label=label
+        )
+
+        # Add shaded area for standard deviation
+        plt.fill_between(
+            method_df["n_rep"],
+            rolling_avg - rolling_std,
+            rolling_avg + rolling_std,
+            color=color,
+            alpha=0.2,
+        )
+
+    # Add titles and labels
+    plt.title("CX Gate Count Comparison Across Compilation Methods", fontsize=16)
+    plt.xlabel("Circuit Evaluation Index", fontsize=14)
+    plt.ylabel("Number of CX Gates", fontsize=14)
+    plt.legend(fontsize=12)
+
+    # Add statistics in text box
+    stats_text = "Mean CX Count:\n"
+    for method, label in zip(methods, labels):
+        mean_cx = df[df["method"] == method]["cx"].mean()
+        stats_text += f"{label}: {mean_cx:.2f}\n"
+
+    plt.figtext(
+        0.02, 0.02, stats_text, fontsize=12, bbox=dict(facecolor="white", alpha=0.8)
+    )
+
+    # Save the figure
+    plt.tight_layout()
+    plt.savefig("cx_count_comparison.png", dpi=300)
+    plt.show()
+
+
+def main(n_qubits: int = 5, nr_gates: int = 1000):
     """
     Execute a single experiment with random clifford circuits and store the respective gate count into a dataframe
     :param n_qubits:
@@ -173,9 +247,11 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
     :return:
     """
 
+    device = get_default_device()  # mps seems not working well???
+    device = "cpu"
     # Pre-train a model
     model = pretrain_a_model_from_file(
-        "nn/training_data_perm.pkl", max_samples=None, epochs=50
+        "nn/training_data_perm_5_qubit.pkl", None, 100, device
     )
     # model = curriculum_train(
     #     "nn/training_data_perm.pkl", max_samples=None, epochs_per_stage=25
@@ -214,7 +290,7 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
 
         # Dummy_perm compilation
         df_dictionary = pd.DataFrame(
-            [dummy_perm_compilation(circuit.copy(), topo, i, model)]
+            [dummy_perm_compilation(circuit.copy(), topo, i, model, device)]
         )
         # df_dictionary = pd.DataFrame(
         #     [dummy_perm_compilation(circuit.copy(), topo, i, sl_model)]
@@ -225,9 +301,32 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
     # Convert the cx column to a numerical type
     df["cx"] = pd.to_numeric(df["cx"])
 
+    # Create a combined method from existing results
+    combined_results = []
+    for rep in df["n_rep"].unique():
+        # Get results for this circuit
+        circuit_df = df[df["n_rep"] == rep]
+        # Get rows for both methods
+        heuristic_row = circuit_df[circuit_df["method"] == "normal_heuristic"].iloc[0]
+        dummy_row = circuit_df[circuit_df["method"] == "dummy-perm"].iloc[0]
+        # Choose the better one
+        if heuristic_row["cx"] <= dummy_row["cx"]:
+            best_row = heuristic_row.copy()
+        else:
+            best_row = dummy_row.copy()
+        # Update the method name
+        best_row["method"] = "combined_min"
+        # Add to results
+        combined_results.append(best_row)
+    # Add combined results to the DataFrame
+    combined_df = pd.DataFrame(combined_results)
+    df = pd.concat([df, combined_df], ignore_index=True)
+
     df.to_csv("test_clifford_synthesis.csv", index=False)
     # Question: what should be the comparision metric? Mean, median, std, mse, etc.?
     print(df.groupby("method").mean())
+
+    add_cx_trend_plot(df)  # Plot the results
 
     # Is the difference just luck?
     from scipy.stats import ttest_ind
