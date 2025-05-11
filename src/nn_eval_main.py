@@ -41,6 +41,7 @@ from src.nn.permutation_math import (
     ensemble_predict_permutation,
     curriculum_train,
     get_default_device,
+    predict_permutation_fixed_dismatch,
 )
 
 import torch
@@ -154,10 +155,15 @@ def dummy_perm_compilation(
 ):
     clifford_tableau = CliffordTableau(circuit.n_qubits)
     clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
-    best_permutation = predict_permutation_gumbel(model, clifford_tableau, device)
+    # best_permutation = predict_permutation_gumbel(model, clifford_tableau, device)
+    best_permutation = predict_permutation_fixed_dismatch(
+        model, clifford_tableau, device
+    )
     # best_permutation = predict_permutation_beam(model, clifford_tableau, device)
     # best_permutation = entropy_guided_search(model, clifford_tableau, device)
     # best_permutation = ensemble_predict_permutation(model, clifford_tableau, device)
+    # print(best_permutation)
+
     best_permutation = iter(best_permutation[0])
 
     def pick_pivot_callback(
@@ -239,7 +245,7 @@ def add_cx_trend_plot(df):
     plt.show()
 
 
-def main(n_qubits: int = 5, nr_gates: int = 1000):
+def main(n_qubits: int = 4, nr_gates: int = 1000):
     """
     Execute a single experiment with random clifford circuits and store the respective gate count into a dataframe
     :param n_qubits:
@@ -250,9 +256,7 @@ def main(n_qubits: int = 5, nr_gates: int = 1000):
     device = get_default_device()  # mps seems not working well???
     device = "cpu"
     # Pre-train a model
-    model = pretrain_a_model_from_file(
-        "nn/training_data_perm_5_qubit.pkl", None, 100, device
-    )
+    # model = pretrain_a_model_from_file("nn/training_data_perm.pkl", None, 100, device)
     # model = curriculum_train(
     #     "nn/training_data_perm.pkl", max_samples=None, epochs_per_stage=25
     # )
@@ -261,11 +265,21 @@ def main(n_qubits: int = 5, nr_gates: int = 1000):
     # )
     # sl_model = supervised_cx_fine_tune(model, sl_dataset, epochs=50, device="cpu")
 
+    checkpoint = torch.load(
+        "ordered_permutation_model_100_earlystop_butno.pth", map_location="cpu"
+    )
+    print(type(checkpoint))
+    if isinstance(checkpoint, dict):
+        print(checkpoint.keys())
+    model = OrderedPermutationTransformer(n_qubits=n_qubits, dim=256, num_layers=12)
+    model.load_state_dict(checkpoint)
+    model.eval()
+
     df = pd.DataFrame(
         columns=["n_rep", "num_qubits", "method", "h", "s", "cx", "depth"]
     )
     topo = Topology.complete(n_qubits)
-    for i in range(1000):
+    for i in range(1):
         circuit = random_hscx_circuit(nr_qubits=n_qubits, nr_gates=nr_gates)
 
         # Our compilation e.g. the baseline from the paper

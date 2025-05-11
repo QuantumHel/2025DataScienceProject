@@ -1,7 +1,7 @@
-from nn_eval_main import add_cx_trend_plot
+# from nn_eval_main import add_cx_trend_plot
 import pandas as pd
 
-df = pd.read_csv("test_clifford_synthesis_5_qubit.csv")
+df = pd.read_csv("test_clifford_synthesis.csv")
 # add_cx_trend_plot(df)
 
 

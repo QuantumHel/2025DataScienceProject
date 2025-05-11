@@ -346,12 +346,15 @@ class OrderedPermutationTransformer(nn.Module):
                     nn.GELU(),
                     nn.Linear(2 * n_qubits**2, n_qubits**2),
                 )
-                for _ in range(10)  # Max sequence length
+                # for _ in range(10)  # Max sequence length
+                for _ in range(
+                    n_qubits
+                )  # Max sequence length (try dynamic, theoretically correct)
             ]
         )
 
-        # Adaptive Sequence Length Prediction
-        self.stop_head = nn.Linear(dim, 1)
+        # # Adaptive Sequence Length Prediction
+        # self.stop_head = nn.Linear(dim, 1) # no need for dynamic (n-qubit) length prediction
 
         # # Add CX Prediction Head, works well
         # self.cx_head = nn.Sequential(
@@ -422,10 +425,11 @@ class OrderedPermutationTransformer(nn.Module):
         output = torch.zeros(B, self.dim, device=tableau.device)  # [batch_size, dim]
 
         predictions = []
-        stop_logits = []
+        # stop_logits = [] # not needed for dynamic length
         cx_predicitons = []  # For CX-prediction
 
-        for t in range(10):  # Max steps
+        # for t in range(10):  # Max steps
+        for t in range(self.n_qubits):  # dynamic length
             # # Transformer Decoder
             # output = self.decoder(tgt=output.unsqueeze(0), memory=memory).squeeze(0)
 
@@ -442,7 +446,7 @@ class OrderedPermutationTransformer(nn.Module):
             predictions.append(pred.view(B, self.n_qubits, self.n_qubits))
 
             # Stop Prediction
-            stop_logits.append(self.stop_head(output))
+            # stop_logits.append(self.stop_head(output)) # not needed for dynamic length
 
             # For CX-prediction
             # cx_pred = self.cx_head(output) # This line is replaced by the two lines below for sophisticated CX prediction
@@ -463,7 +467,7 @@ class OrderedPermutationTransformer(nn.Module):
         predictions = torch.stack(predictions, dim=1)
 
         # Stack stop logits -> [batch_size, seq_len]
-        stop_logits = torch.cat(stop_logits, dim=1)
+        # stop_logits = torch.cat(stop_logits, dim=1) # not needed for dynamic length
 
         # # For CX-prediction
         # cx_predicitons = torch.cat(cx_predicitons, dim=1)  # [batch_size, seq_len]
@@ -472,9 +476,12 @@ class OrderedPermutationTransformer(nn.Module):
         # For CX prediction, use both tableau features and permutation info
         # perm_features = predictions[0].flatten(1)  # Use permutation matrix features
         # cx_predicitons = self.cx_head(torch.cat([output, perm_features], dim=1))
-        cx_predicitons = torch.cat(cx_predicitons, dim=1)
+        # cx_predicitons = torch.cat(cx_predicitons, dim=1)
+        # Replace the above stacking logic to output a single scalar
+        cx_predicitons = torch.mean(torch.stack(cx_predicitons, dim=1), dim=1)
 
-        return predictions, stop_logits, cx_predicitons
+        # return predictions, stop_logits, cx_predicitons
+        return predictions, cx_predicitons
 
 
 class SequentialSinkhorn(nn.Module):
@@ -496,12 +503,13 @@ class SequentialSinkhorn(nn.Module):
 class OrderedPermutationLoss(nn.Module):
     # def __init__(self, alpha=0.5, beta=0.1):
     # def __init__(self, alpha=0.5, beta=0.1, gamma=2.0): # original
-    def __init__(
-        self, alpha=0.5, beta=0.1, gamma=2.0, entropy_weight=0.1, max_entropy=0.5
-    ):  # gamma=8.0 will sometimes result in stuck at loss 270.0
+    # def __init__(
+    #     self, alpha=0.5, beta=0.1, gamma=2.0, entropy_weight=0.1, max_entropy=0.5
+    # ):  # gamma=8.0 will sometimes result in stuck at loss 270.0
+    def __init__(self, gamma=2.0):
         super().__init__()
-        self.alpha = alpha  # Stop signal loss weight
-        self.beta = beta  # Length regularization weight
+        # self.alpha = alpha  # Stop signal loss weight
+        # self.beta = beta  # Length regularization weight
         self.gamma = gamma  # CX prediction loss weight
         # self.entropy_weight = entropy_weight  # Entropy regularization weight
         # self.max_entropy = max_entropy  # Max entropy for scaling
@@ -524,18 +532,19 @@ class OrderedPermutationLoss(nn.Module):
     #     return False
 
     # def forward(self, preds, stop_logits, targets, masks):
-    def forward(
-        self, preds, stop_logits, targets, masks, cx_preds=None, cx_targets=None
-    ):
+    # def forward(
+    #     self, preds, stop_logits, targets, masks, cx_preds=None, cx_targets=None
+    # ):
+    def forward(self, preds, targets, masks, cx_preds=None, cx_targets=None):
         """
         preds: [bs, seq_len, n, n]
-        stop_logits: [bs, seq_len] - This has shape [32, 10]
+        # stop_logits: [bs, seq_len] - This has shape [32, 10]
         targets: [bs, seq_len, n, n]
         masks: [bs, seq_len] - But this might have shape [32, 1]
-        cx_preds: [bs, seq_len]
-        cx_targets: [bs, seq_len]
+        cx_preds: [bs, 1]
+        cx_targets: [bs, 1]
         """
-        bs, seq_len = stop_logits.shape  # Use stop_logits shape instead of masks
+        # bs, seq_len = stop_logits.shape  # Use stop_logits shape instead of masks
 
         # # 1. Permutation matrix loss (masked)
         # # Make sure targets has same sequence length as preds
@@ -620,28 +629,44 @@ class OrderedPermutationLoss(nn.Module):
             perm_losses.append(torch.stack(losses).min())
         perm_loss = torch.stack(perm_losses).mean()
 
-        # 2. Stop signal loss with properly sized tensors
-        # Create stop_labels with the right size [bs, seq_len]
-        stop_labels = torch.zeros_like(stop_logits)  # Match size exactly
+        # # 2. Stop signal loss with properly sized tensors
+        # # Create stop_labels with the right size [bs, seq_len]
+        # stop_labels = torch.zeros_like(stop_logits)  # Match size exactly
 
-        # Fill first positions with 1s (assuming first step should always stop)
-        if masks.size(1) > 0:
-            stop_labels[:, 0] = 1.0
+        # # Fill first positions with 1s (assuming first step should always stop)
+        # if masks.size(1) > 0:
+        #     stop_labels[:, 0] = 1.0
 
-            # If masks has more than 1 column, shift it
-            if masks.size(1) > 1:
-                stop_labels[:, 1:] = masks[:, :-1]  # Shift right
+        #     # If masks has more than 1 column, shift it
+        #     if masks.size(1) > 1:
+        #         stop_labels[:, 1:] = masks[:, :-1]  # Shift right
 
-        stop_loss = F.binary_cross_entropy_with_logits(
-            stop_logits, stop_labels, reduction="mean"
-        )
+        # stop_loss = F.binary_cross_entropy_with_logits(
+        #     stop_logits, stop_labels, reduction="mean"
+        # )
 
-        # 3. Length regularization
-        pred_lengths = torch.sigmoid(stop_logits).sum(dim=1)  # [bs]
-        true_lengths = masks.sum(dim=1).clamp(min=1.0)  # [bs], avoid zeros
-        length_loss = F.l1_loss(pred_lengths, true_lengths)
+        # # 3. Length regularization
+        # pred_lengths = torch.sigmoid(stop_logits).sum(dim=1)  # [bs]
+        # true_lengths = masks.sum(dim=1).clamp(min=1.0)  # [bs], avoid zeros
+        # length_loss = F.l1_loss(pred_lengths, true_lengths)
 
-        # 4. CX prediction loss (if cx_targets is provided)
+        # # 4. CX prediction loss (if cx_targets is provided)
+        # cx_loss = 0
+        # if cx_preds is not None and cx_targets is not None:
+        #     # Make sure cx_targets is a tensor
+        #     if not isinstance(cx_targets, torch.Tensor):
+        #         cx_targets = torch.tensor(cx_targets, device=cx_preds.device).float()
+
+        #     # Ensure shapes match
+        #     if cx_targets.dim() == 1:
+        #         cx_targets = cx_targets.unsqueeze(1).expand(-1, cx_preds.size(1))
+
+        #     # Use MSE loss for regression (no sigmoid needed with ReLU output), grows quadratically
+        #     cx_loss = F.mse_loss(cx_preds, cx_targets, reduction="mean")
+        #     # Try Replace MSE with Huber loss for CX prediction, results not that good? less sensitive to outliers, grows linearly
+        #     # cx_loss = F.huber_loss(cx_preds, cx_targets, reduction="mean")
+
+        # 4. CX prediction loss (now cx_pred is [bs, 1], not [bs, seq_len])
         cx_loss = 0
         if cx_preds is not None and cx_targets is not None:
             # Make sure cx_targets is a tensor
@@ -650,12 +675,10 @@ class OrderedPermutationLoss(nn.Module):
 
             # Ensure shapes match
             if cx_targets.dim() == 1:
-                cx_targets = cx_targets.unsqueeze(1).expand(-1, cx_preds.size(1))
+                cx_targets = cx_targets.unsqueeze(1)  # Shape: [batch_size, 1]
 
-            # Use MSE loss for regression (no sigmoid needed with ReLU output), grows quadratically
+            # Use MSE loss for regression (no sigmoid needed with ReLU output)
             cx_loss = F.mse_loss(cx_preds, cx_targets, reduction="mean")
-            # Try Replace MSE with Huber loss for CX prediction, results not that good? less sensitive to outliers, grows linearly
-            # cx_loss = F.huber_loss(cx_preds, cx_targets, reduction="mean")
 
         # # 5. Try Adding Entropy regularization (encourage exploration, not improving)
         # # preds: [bs, seq_len, n, n]
@@ -671,20 +694,20 @@ class OrderedPermutationLoss(nn.Module):
 
         return (
             perm_loss
-            + self.alpha * stop_loss
-            + self.beta * length_loss
             + self.gamma * cx_loss
-            # + self.entropy_weight * entropy  # Add entropy regularization (not improving)
+            # + self.alpha * stop_loss
+            # + self.beta * length_loss
+            # # + self.entropy_weight * entropy  # Add entropy regularization (not improving)
         )
 
 
 def train(model, dataloader, epochs, device):
     # Initialization
     model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=5e-4, total_steps=epochs * len(dataloader), pct_start=0.3
-    )  # increase max_lr from 2e-4 to 5e-4, results, not improving!
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    #     optimizer, max_lr=5e-4, total_steps=epochs * len(dataloader), pct_start=0.3
+    # )  # increase max_lr from 2e-4 to 5e-4, results, not improving!
     # # Try another scheduler, results, not good
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     #     optimizer, T_max=epochs, eta_min=1e-6, last_epoch=-1
@@ -696,12 +719,53 @@ def train(model, dataloader, epochs, device):
     # # # Gradient clipping, introduced with CosineAnnealingLR and CosineAnnealingWarmRestarts
     # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
 
-    # Loss function
-    criterion = OrderedPermutationLoss(gamma=5.0)  # Adjust gamma as needed
-    # sinkhorn = SequentialSinkhorn()
+    # # Loss function
+    # criterion = OrderedPermutationLoss(gamma=5.0)  # Adjust gamma as needed
+    # # sinkhorn = SequentialSinkhorn()
 
-    # Gradient accumulation (for larger batches)
-    accum_steps = 4
+    # # Gradient accumulation (for larger batches)
+    # accum_steps = 4
+
+    # Some configuration changes after removing the stop head
+    # optimizer = torch.optim.AdamW(
+    #     model.parameters(), lr=5e-5, weight_decay=1e-4
+    # )  # Increased weight decay
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-4,  # Higher base learning rate
+        weight_decay=1e-5,  # Reduced weight decay
+        betas=(0.9, 0.99),  # Higher beta2 for momentum
+    )
+
+    # 2. IMPROVE LEARNING RATE SCHEDULE
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    #     optimizer,
+    #     max_lr=3e-4,  # Reduced from 5e-4
+    #     total_steps=epochs * len(dataloader),
+    #     pct_start=0.2,  # Faster warmup
+    #     div_factor=25,  # Greater initial LR reduction
+    #     final_div_factor=1e4,  # Ensure very small final LR
+    # )
+    # Use a cyclical learning rate with periodic spikes
+    scheduler = torch.optim.lr_scheduler.CyclicLR(
+        optimizer,
+        base_lr=5e-5,
+        max_lr=5e-3,  # Much higher max LR to escape plateaus
+        step_size_up=300,
+        cycle_momentum=True,
+        mode="triangular2",
+    )
+    # 3. ADJUST LOSS FUNCTION BALANCE
+    criterion = OrderedPermutationLoss(
+        gamma=2.0
+    )  # Reduced from 5.0, gamma = 2.0 works fine, 5 stuck at loss 170.0, 1 stuck at 34.0646
+    # 4. BETTER GRADIENT HANDLING
+    accum_steps = 2  # Reduced from 4
+    # Also Add early stopping
+    best_loss = float("inf")
+    patience = 15
+    patience_counter = 0
+    best_model_state = None
 
     loss_history = []  # To track loss per epoch
     # best_validation_score = float("inf")  # for tracking the best model
@@ -735,9 +799,10 @@ def train(model, dataloader, epochs, device):
 
             # 2. Forward pass -------------------------------------------------
             # raw_preds, stop_logits = model(tableaus)  # [batch_size, seq_len, n, n]
-            raw_preds, stop_logits, cx_preds = model(
-                tableaus
-            )  # [batch_size, seq_len, n, n]
+            # raw_preds, stop_logits, cx_preds = model(
+            #     tableaus
+            # )  # [batch_size, seq_len, n, n]
+            raw_preds, cx_preds = model(tableaus)  # [batch_size, seq_len, n, n]
 
             # 3. Apply Sinkhorn normalization to batch-first format
             sinkhorn_preds = []
@@ -761,7 +826,7 @@ def train(model, dataloader, epochs, device):
             # Convert cx_targets from list to properly shaped tensor
             cx_targets_tensor = torch.tensor(cx_targets, device=device).float()
 
-            # Reshape to match cx_preds dimensions [batch_size, seq_len]
+            # Reshape to match cx_preds dimensions [batch_size, 1], not [batch_size, seq_len]
             cx_targets_tensor = cx_targets_tensor.unsqueeze(1).expand(
                 -1, cx_preds.size(1)
             )
@@ -771,11 +836,11 @@ def train(model, dataloader, epochs, device):
 
             loss = criterion(
                 preds,  # [batch_size, seq_len, n, n]
-                stop_logits,  # [batch_size, seq_len]
+                # stop_logits,  # [batch_size, seq_len]
                 targets,  # [batch_size, seq_len, n, n]
                 masks,  # [batch_size, seq_len]
-                cx_preds=cx_preds,  # [batch_size, seq_len]
-                cx_targets=cx_targets_tensor,  # [batch_size, seq_len]
+                cx_preds=cx_preds,  # [batch_size, 1]
+                cx_targets=cx_targets_tensor,  # [batch_size, 1]
             )
 
             # 5. Backpropagation ----------------------------------------------
@@ -783,7 +848,9 @@ def train(model, dataloader, epochs, device):
 
             # 6. Gradient accumulation -----------------------------------------
             if (batch_idx + 1) % accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), 2.0
+                )  # from 1.0 to 2.0 for removing stop head
                 optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step()  # For OneCycleLR
@@ -807,6 +874,19 @@ def train(model, dataloader, epochs, device):
         # prev_loss = avg_loss  # Try adjusting entropy weight dynamically
         loss_history.append(avg_loss)
         print(f"Epoch {epoch+1} completed | Average Loss: {avg_loss:.4f}")
+
+        # 5. IMPLEMENT EARLY STOPPING
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            patience_counter = 0
+            best_model_state = copy.deepcopy(model.state_dict())
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            model.load_state_dict(best_model_state)  # Restore best model
+            break
 
     # Plotting loss history
     plt.figure(figsize=(10, 6))
@@ -1280,7 +1360,8 @@ def supervised_cx_fine_tune(model, dataset, epochs, device):
 
                 # Generate permutation candidates and find best one
                 with torch.no_grad():
-                    raw_preds, _, cx_preds = model(tableau_tensor)
+                    # raw_preds, _, cx_preds = model(tableau_tensor)
+                    raw_preds, cx_preds = model(tableau_tensor)
                     target_perm = None
                     best_cx = baseline_cx
 
@@ -1555,7 +1636,8 @@ def compute_weighted_score(pred_metrics):
     """
     # Define weights for each metric
     cx_weight = 10.0  # Try adjusting from 10 to 50; 50 not good either
-    depth_weight = 1.0  # 1.0 seems better than 0.1???
+    # depth_weight = 1.0  # 1.0 seems better than 0.1???
+    depth_weight = 0.0  # for now, only cx seems better
     # Compute weighted score, only keep cx seems worse
     score = cx_weight * pred_metrics["cx"] + depth_weight * pred_metrics["depth"]
     # score = pred_metrics["cx"]
@@ -1741,7 +1823,10 @@ def predict_permutation_gumbel(model, clifford_tableau, device):
 
     with torch.no_grad():
         # Get predictions for all steps
-        raw_preds, _, cx_preds = model(tableau_tensor)
+        # raw_preds, _, cx_preds = model(tableau_tensor)
+        raw_preds, cx_preds = model(tableau_tensor)
+
+        print(f"raw_preds: {raw_preds.shape}, cx_preds: {cx_preds.shape}")
 
         # # Sort steps by cx count
         # step_indices = torch.argsort(
@@ -1764,8 +1849,23 @@ def predict_permutation_gumbel(model, clifford_tableau, device):
             # Apply Sinkhorn normalization
             logits = raw_preds[0, step_idx]
 
-            # Generate multiple permutation samples with Gumbel-Sinkhorn
-            perm_samples = gumbel_sinkhorn(logits, temp=0.1, n_samples=10)
+            # Try adaptive temperatures
+            # Use CX predictions to set temperature
+            cx_prediction = cx_preds[0, step_idx].item()
+            # Lower temperature (more deterministic) when CX prediction is low (more confident)
+            # Higher temperature (more exploration) when CX prediction is high
+            base_temp = 0.1
+            temp_scale = min(max(cx_prediction / 10.0, 0.2), 3.0)
+            adaptive_temps = [
+                base_temp * temp_scale * factor for factor in [0.5, 1.0, 2.0]
+            ]
+            perm_samples = []
+            for temp in adaptive_temps:
+                # Generate multiple permutation samples with Gumbel-Sinkhorn
+                perm_samples += gumbel_sinkhorn(logits, temp=temp, n_samples=3)
+
+            # # Generate multiple permutation samples with Gumbel-Sinkhorn
+            # perm_samples = gumbel_sinkhorn(logits, temp=0.1, n_samples=10)
             for sample_matrix in perm_samples:
                 perm_matrix = sample_matrix.cpu().numpy()
 
@@ -1834,6 +1934,154 @@ def predict_permutation_gumbel(model, clifford_tableau, device):
 
     # print(f"Best score: {best_score}")
     return [best_perm]  # Keep list format for compatibility
+
+
+def decompose_cumulative_matrices(cumulative_matrices):
+    step_matrices = []
+    prev_matrix = torch.eye(
+        cumulative_matrices[0].size(0), device=cumulative_matrices[0].device
+    )
+    for current_matrix in cumulative_matrices:
+        # Ensure current_matrix is a valid permutation matrix
+        current_matrix_hard = (
+            current_matrix == current_matrix.max(dim=-1, keepdim=True)[0]
+        ).float()
+        # Compute step matrix
+        step_matrix = current_matrix_hard @ prev_matrix.T
+        step_matrices.append(step_matrix)
+        prev_matrix = current_matrix_hard
+    return step_matrices
+
+
+def extract_single_pivot(step_matrix, used_rows=None, used_cols=None):
+    """
+    Extract the most significant pivot from a step matrix, avoiding already used rows/columns.
+
+    Args:
+        step_matrix: The step matrix to extract pivot from
+        used_rows: Set of row indices already used in previous pivots
+        used_cols: Set of column indices already used in previous pivots
+    """
+    # Initialize tracking sets if not provided
+    if used_rows is None:
+        used_rows = set()
+    if used_cols is None:
+        used_cols = set()
+
+    # Binarize step_matrix to a permutation matrix
+    row_ind, col_ind = linear_sum_assignment(-step_matrix.cpu().numpy())
+
+    # Find the most significant non-identity mapping that doesn't use already used rows/columns
+    max_val = -1
+    best_pivot = None
+
+    for i, j in zip(row_ind, col_ind):
+        if i not in used_rows and j not in used_cols:  # Only consider unused rows/cols
+            val = step_matrix[i, j].item()
+            if val > max_val:
+                max_val = val
+                best_pivot = (int(i), int(j))
+
+    return best_pivot
+
+
+def validate_pivot_tuples(pivot_tuples, n_qubits):
+    """Check if pivot_tuples is valid according to the criteria:
+    - All first elements of tuples form a permutation of [0, 1, ..., n_qubits-1].
+    - All second elements of tuples form a permutation of [0, 1, ..., n_qubits-1].
+    """
+    if not pivot_tuples:
+        return False
+
+    first_elements = [i for i, _ in pivot_tuples]
+    second_elements = [j for _, j in pivot_tuples]
+
+    # Check if all indices are valid
+    valid_indices = set(range(n_qubits))
+    if any(i not in valid_indices or j not in valid_indices for i, j in pivot_tuples):
+        return False
+
+    # Check if first and second elements are permutations
+    def is_permutation(lst):
+        return sorted(lst) == list(range(n_qubits))
+
+    return is_permutation(first_elements) and is_permutation(second_elements)
+
+
+# Not ready I am afraid, it has no bugs but not correctly working
+def predict_permutation_fixed_dismatch(model, clifford_tableau, device):
+    """Returns the best permutation after evaluating multiple candidates"""
+    device = torch.device(device)
+    model = model.to(device)
+
+    # Get tableau tensor
+    tableau_tensor = tableau_to_tensor(clifford_tableau)
+    tableau_tensor = tableau_tensor.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        raw_preds, _ = model(tableau_tensor)
+        logits_seq = raw_preds[0]  # Shape: [seq_len, n_qubits, n_qubits]
+
+        # 1. Apply Sinkhorn normalization to get cumulative permutation matrices
+        cumulative_matrices = []
+        temperature = 0.1
+        for logits in logits_seq:
+            # Add Gumbel noise for stochasticity
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits)))
+            noisy_logits = (logits + gumbel_noise) / temperature
+            # Sinkhorn iterations
+            for _ in range(20):
+                noisy_logits = noisy_logits - torch.logsumexp(
+                    noisy_logits, dim=-1, keepdim=True
+                )
+                noisy_logits = noisy_logits - torch.logsumexp(
+                    noisy_logits, dim=-2, keepdim=True
+                )
+            # Straight-through estimator: hard permutation in forward pass, soft in backward
+            hard_perm = (
+                noisy_logits == noisy_logits.max(dim=-1, keepdim=True)[0]
+            ).float()
+            perm_matrix = hard_perm - (hard_perm - torch.exp(noisy_logits)).detach()
+            cumulative_matrices.append(perm_matrix)
+
+        # 2. Decompose cumulative matrices into step matrices
+        step_matrices = decompose_cumulative_matrices(cumulative_matrices)
+
+        for step_matrix in step_matrices:
+            print(step_matrix)
+
+        # 3. Extract swap operations from each step matrix
+        pivot_tuples = []
+        used_rows = set()
+        used_cols = set()
+        n_qubits = clifford_tableau.n_qubits
+
+        # Process step matrices in order
+        for step_matrix in step_matrices:
+            # Extract the best non-conflicting pivot
+            pivot = extract_single_pivot(step_matrix, used_rows, used_cols)
+
+            if pivot is not None:
+                i, j = pivot
+                pivot_tuples.append(pivot)
+                used_rows.add(i)
+                used_cols.add(j)
+
+                # Check if we have enough pivots
+                if len(pivot_tuples) == n_qubits:
+                    break
+
+        # Complete the permutation if necessary
+        if len(pivot_tuples) < n_qubits:
+            # Find unused rows and columns
+            unused_rows = set(range(n_qubits)) - used_rows
+            unused_cols = set(range(n_qubits)) - used_cols
+
+            # Match unused rows to unused columns
+            for i, j in zip(sorted(list(unused_rows)), sorted(list(unused_cols))):
+                pivot_tuples.append((i, j))
+
+    return [pivot_tuples]  # Keep list format for compatibility
 
 
 # Try beam search based on the predict_permutation_gumbel function
@@ -1968,7 +2216,8 @@ def entropy_guided_search(model, clifford_tableau, device, n_samples=5):
 
     with torch.no_grad():
         # Forward pass to get raw predictions
-        raw_preds, _, cx_preds = model(tableau_tensor)
+        # raw_preds, _, cx_preds = model(tableau_tensor)
+        raw_preds, _ = model(tableau_tensor)
 
         # Calculate entropy for each position (high entropy = uncertainty)
         entropies = []
@@ -2098,7 +2347,8 @@ def ensemble_predict_permutation(model, tableau, device):
     # Add more aggressive temperature sampling
     tableau_tensor = tableau_to_tensor(tableau).unsqueeze(0).to(device)
     with torch.no_grad():
-        raw_preds, _, cx_preds = model(tableau_tensor)
+        # raw_preds, _, cx_preds = model(tableau_tensor)
+        raw_preds, cx_preds = model(tableau_tensor)
         # Try extreme temperatures for more diversity
         for temp in [0.005, 1.0]:  # Very low and very high temps
             perm_samples = gumbel_sinkhorn(raw_preds[0, 0], temp=temp, n_samples=5)
@@ -2764,23 +3014,23 @@ def curriculum_train(data_file, max_samples, epochs_per_stage, device):
     return model
 
 
-# # Example 1 of usage (without fine-tuning):
-# device = get_default_device()
-# print(f"Using device: {device}")
-# device = "cpu"
-# n_qubit = 5
-# model = pretrain_a_model_from_file("training_data_perm_5_qubit.pkl", 320, 10, device)
-# # model = curriculum_train(
-# #     data_file="training_data_perm.pkl", max_samples=320, epochs_per_stage=5
-# # )
-# circuit = random_hscx_circuit(nr_qubits=n_qubit, nr_gates=1000)
-# tableau = tableau_from_circuit(CliffordTableau(n_qubit), circuit)
-# permutations = predict_permutation_gumbel(model, tableau, device)
-# # permutations = predict_permutation_beam(model, tableau)
-# # permutations = entropy_guided_search(model, tableau, device)
-# # permutations = ensemble_predict_permutation(model, tableau, device)
-# # permutations = predict_permutation_mcts(model, tableau)
-# print(permutations)
+# Example 1 of usage (without fine-tuning):
+device = get_default_device()
+print(f"Using device: {device}")
+device = "cpu"
+n_qubit = 4
+model = pretrain_a_model_from_file("training_data_perm.pkl", 320, 2, device)
+# model = curriculum_train(
+#     data_file="training_data_perm.pkl", max_samples=320, epochs_per_stage=5
+# )
+circuit = random_hscx_circuit(nr_qubits=n_qubit, nr_gates=1000)
+tableau = tableau_from_circuit(CliffordTableau(n_qubit), circuit)
+permutations = predict_permutation_fixed_dismatch(model, tableau, device)
+# permutations = predict_permutation_beam(model, tableau)
+# permutations = entropy_guided_search(model, tableau, device)
+# permutations = ensemble_predict_permutation(model, tableau, device)
+# permutations = predict_permutation_mcts(model, tableau)
+print(permutations)
 
 # # Example 2 of usage (with SL fine-tuning):
 # model = pretrain_a_model_from_file("training_data_perm.pkl", max_samples=320, epochs=20)
