@@ -20,7 +20,7 @@ from src.utils import random_hscx_circuit, tableau_from_circuit
 np.seterr(over='ignore')
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-model_path = "models/finetuned_from_base_nrgates_21.pt"
+model_path = "models/best_model.pt"
 checkpoint = torch.load(model_path, map_location=torch.device("cpu"))
 CONFIG = checkpoint["config"]
 
@@ -103,14 +103,15 @@ def rl_compilation(circuit: Circuit, topology: Topology, n_rep: int):
     circ_out = synthesize_tableau_perm_row_col(tableau, topology, pick_pivot_callback=pick_pivot)
     return {"n_rep": n_rep, "method": "rl_model", **collect_circuit_data(circ_out)}
 
-def main(n_qubits: int = 4, nr_gates: int = 20):
+def main(n_qubits: int = 4, nr_gates: int = 10):
     df = pd.DataFrame(columns=["n_rep", "num_qubits", "method", "h", "s", "cx", "depth"])
     topology = Topology.complete(n_qubits)
 
     # Initialize confusion matrix-like structure for RL vs. Optimum scores
-    confusion_matrix = pd.DataFrame()   
+    confusion_matrix = pd.DataFrame() 
+    if nr_gates > 20: print("Warning: nr_gates > 20, RL agent only trained up to 20 gate compexity.")  
 
-    for i in range(100):
+    for i in range(1000):
         print(f"Iteration {i}")
         circuit = random_hscx_circuit(nr_qubits=n_qubits, nr_gates=nr_gates)
 
@@ -128,15 +129,9 @@ def main(n_qubits: int = 4, nr_gates: int = 20):
         optimum_score = method_scores["optimum"]
 
         # Update confusion matrix-like structure
-        if optimum_score not in confusion_matrix.index:
-            # Add a new row for the optimum score, initializing all columns to 0
-            confusion_matrix = pd.concat(
-                [confusion_matrix, pd.DataFrame([[0] * len(confusion_matrix.columns)], index=[optimum_score])],
-                axis=0
-            )
-        if rl_score not in confusion_matrix.columns:
-            # Add a new column for the RL score, initializing all rows to 0
-            confusion_matrix[rl_score] = 0
+        if optimum_score not in confusion_matrix.index or rl_score not in confusion_matrix.columns:
+            confusion_matrix.loc[optimum_score, rl_score] = 0
+
         confusion_matrix.loc[optimum_score, rl_score] += 1
 
         # Print circuit if RL score is +5 worse than optimum

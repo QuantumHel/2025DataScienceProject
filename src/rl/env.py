@@ -10,6 +10,7 @@ from pauliopt.gates import CX, H, S
 from pauliopt.topologies import Topology
 from pauliopt.utils import is_cutting
 from src.utils import random_hscx_circuit, tableau_from_circuit
+from src.nn.brute_force_data import get_best_cnots
 
 Array3D = np.ndarray
 
@@ -41,12 +42,27 @@ class CliffordTableauEnv(gym.Env[Tuple[int, int], np.ndarray]):
         self.initial_tableau = tableau_from_circuit(tableau, circuit)
         self.clifford_tableau_to_reduce = self.initial_tableau.inverse()
 
+        self.true_optimal_cx = get_best_cnots(self.clifford_tableau_to_reduce.inverse(), self.topology)[0][1]
+        
         return self._get_obs(), self.allowed_rows.copy(), self.allowed_cols.copy()
 
     def get_current_stats(self) -> int:
         if self.final_cx is not None:
             return self.final_cx
         return self.final_circuit.to_qiskit().count_ops().get("cx", 0)
+    
+    def _compute_supervised_reward(self, cx_found: int, cx_optimal: int) -> float:
+        if cx_found <= cx_optimal:
+            return self.final_reward
+        elif cx_found <= cx_optimal + 1:
+            return self.final_reward * 0.5
+        elif cx_found <= cx_optimal + 2:
+            return self.final_reward * 0.25
+        else:
+            overshoot = cx_found - cx_optimal
+            penalty = self.final_reward * np.exp(-0.2 * overshoot)
+            penalty = penalty - self.final_reward
+            return max(penalty, self.cx_penalty)
 
     def step(self, action: Tuple[int, int]):
         pivot_row, pivot_col = action
@@ -78,14 +94,17 @@ class CliffordTableauEnv(gym.Env[Tuple[int, int], np.ndarray]):
 
         done = self.qubits_reduced >= self.n_qubits
         
+        """Basic reward structure (commented out):
         if done:
             self.final_cx = self.final_circuit.to_qiskit().count_ops().get("cx", 0)
             bonus = self.final_reward * np.exp(-self.final_exp_decay * self.final_cx)
             curriculum_level = max((self.nr_gates - 5) // 10, 0)
             curriculum_bonus = curriculum_level * 6.0
             reward += bonus + curriculum_bonus
+        """
         
         """
+        Secondary reward structure (commented out):
         if done:
             self.final_cx = self.final_circuit.to_qiskit().count_ops().get("cx", 0)
 
@@ -97,6 +116,10 @@ class CliffordTableauEnv(gym.Env[Tuple[int, int], np.ndarray]):
             curriculum_level = max((self.nr_gates - 5) // 2, 0)
             curriculum_bonus = curriculum_level * 7.5  # You can try 5.0 → 7.5 → 10.0
             """
+        """Supervised finetuning reward structure with true optimal circuit (commented out):"""
+        if done:
+            self.final_cx = self.final_circuit.to_qiskit().count_ops().get("cx", 0)
+            reward = self._compute_supervised_reward(self.final_cx, self.true_optimal_cx)
 
         return (self._get_obs(), self.allowed_rows.copy(), self.allowed_cols.copy()), reward, done, {}
 

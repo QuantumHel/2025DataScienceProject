@@ -8,22 +8,23 @@ from src.rl.agent import DQNAgent
 from src.rl.env import CliffordTableauEnv
 
 CONFIG = {
-    "learning_rate": 0.00005,
-    "batch_size": 128,
+    "learning_rate": 0.00001,
+    "batch_size": 64,
     "epsilon_start": 0,
-    "epsilon_min": 0.00,
+    "epsilon_min": 0.1,
     "epsilon_decay": 0.99995,
-    "gamma": 0.99,
+    "gamma": 0.95,
     "gradient_clip_norm": 1.0,
 
     # Reward structure
-    "cx_penalty": -1,
-    "h_penalty": 0,
-    "s_penalty": 0,
-    "final_reward": 500.0,
+    "final_reward": 50.0,  
+    "reward_clip": 50.0, 
+    "cx_penalty": -5.0,
+    "h_penalty": 0.0,       
+    "s_penalty": 0.0, 
 
     # Target network & replay
-    "target_update_interval": 20,
+    "target_update_interval": 50,
     "replay_every_n_steps": 4,
 
     # Logging & training
@@ -39,9 +40,9 @@ CONFIG = {
 
     # Curriculum learning
     "use_curriculum": True,
-    "curriculum_start_gates": 5,
-    "curriculum_step": 2,
-    "curriculum_max_gates": 1000
+    "curriculum_start_gates": 10,
+    "curriculum_step": 5,
+    "curriculum_max_gates": 51000
 }
 
 def save_checkpoint(agent, episode, best_cx, path):
@@ -70,7 +71,7 @@ def load_checkpoint(agent, path):
 
 def main():
     resume_training = True
-    checkpoint_path = "models/finetuned_from_base_nrgates_21.pt"
+    checkpoint_path = "models/checkpoint_ep_ft_5000.pt"
     start_episode = 0
     
     n_qubits = 4
@@ -97,7 +98,7 @@ def main():
 
     best_cx = float("inf")
     previous_gates = current_gates
-    curriculum_episode_threshold = 5000
+    curriculum_episode_threshold = 10000
     next_curriculum_update = curriculum_episode_threshold
 
     plt.ion()
@@ -169,7 +170,7 @@ def main():
         moving_avg_scores.append(ma_cx)
         moving_avg_rewards.append(ma_reward)
 
-        if episode % 50 == 0:
+        if episode % 5 == 0:
             avg_loss = np.nanmean(agent.losses[-10:]) if agent.losses else float("nan")
             progress.write(
                 f"Ep {episode} | Reward={ma_reward:.2f}, "
@@ -181,10 +182,10 @@ def main():
         if episode % CONFIG["target_update_interval"] == 0:
             agent.update_target_network()
 
-        if episode % 25 == 0:
+        if episode % 5 == 0:
             update_plot()
 
-        if ma_cx < best_cx:
+        if ma_cx < best_cx and episode > 50:
             best_cx = ma_cx
             save_checkpoint(agent, episode, best_cx, "models/best_model.pt")
 
