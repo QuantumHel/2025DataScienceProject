@@ -169,3 +169,16 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# ignore particular files
+src/nn/permutation_pred.py
+src/ordered_permutation_model_100_earlystop_butno.pth
+src/ordered_permutation_model_weird_100_epoch.pth
+src/ordered_permutation_model_5_qubit.pth
+src/ordered_permutation_model3-4-4.pth
+src/ordered_permutation_model3-4.pth
+src/ordered_permutation_model3-1.pth
+src/ordered_permutation_model2-3.pth
+src/ordered_permutation_model2-2.pth
+src/ordered_permutation_model2-1.pth
+src/ordered_permutation_model1.pth
