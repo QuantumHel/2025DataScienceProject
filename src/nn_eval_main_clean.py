@@ -231,7 +231,7 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
 
     # If want to use pre-trained model, uncomment the following lines.
     # The 4-qubit model `ordered_permutation_model.pth` is ready to use.
-    checkpoint = torch.load("ordered_permutation_model.pth", map_location=device)
+    checkpoint = torch.load("src/ordered_permutation_model.pth", map_location=device)
     print(type(checkpoint))
     if isinstance(checkpoint, dict):
         print(checkpoint.keys())
@@ -244,37 +244,29 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
     )
     topo = Topology.complete(n_qubits)
     for i in range(cnt_eval):
+        print(f"Iteration {i}")
         circuit = random_hscx_circuit(nr_qubits=n_qubits, nr_gates=nr_gates)
-
-        # Our compilation e.g. the baseline from the paper
-        df_dictionary = pd.DataFrame([our_compilation(circuit.copy(), topo, i)])
-        df = pd.concat([df, df_dictionary], ignore_index=True)
-        print("Min", df_dictionary["cx"])
-
-        # Optimal compilation
-        df_dictionary = pd.DataFrame([optimal_compilation(circuit.copy(), topo, i)])
-        df = pd.concat([df, df_dictionary], ignore_index=True)
-        print("OPTIMUM", df_dictionary["cx"])
-
-        # Random compilation
-        df_dictionary = pd.DataFrame([random_compilation(circuit.copy(), topo, i)])
-        df = pd.concat([df, df_dictionary], ignore_index=True)
-        print("Random", df_dictionary["cx"])
-
-        # # Group's first ANN compilation
-        # df_dictionary = pd.DataFrame([nn_compilation(circuit.copy(), topo, i)])
-        # df = pd.concat([df, df_dictionary], ignore_index=True)
-        # print("NN", df_dictionary["cx"])
-
-        # Dummy_perm compilation
-        df_dictionary = pd.DataFrame(
-            [dummy_perm_compilation(circuit.copy(), topo, i, model, device)]
-        )
+        method_scores = {}
+        for method_fn in [
+            our_compilation,
+            random_compilation,
+            # nn_compilation,
+            optimal_compilation,
+            dummy_perm_compilation
+        ]:
+            if method_fn == dummy_perm_compilation:
+                row = method_fn(circuit.copy(),topo,i,model,device)
+            else:
+                row = method_fn(circuit.copy(), topo, i)
+            df = pd.concat([df,pd.DataFrame([row])], ignore_index=True)
+            method_scores[row["method"]] = row["cx"]
+            print(f"{row['method']}: {row['cx']}", end=" | ")
+        print("\n")
+        
         # df_dictionary = pd.DataFrame(
         #     [dummy_perm_compilation(circuit.copy(), topo, i, sl_model)]
         # ) # Replace the above line with this line if using SL fine-tuning
-        df = pd.concat([df, df_dictionary], ignore_index=True)
-        print("Dummy-perm", df_dictionary["cx"])
+
 
     # Convert the cx column to a numerical type
     df["cx"] = pd.to_numeric(df["cx"])
@@ -302,6 +294,7 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
 
     df.to_csv("test_clifford_synthesis.csv", index=False)
     # Question: what should be the comparision metric? Mean, median, std, mse, etc.?
+    print("\nMean scores by method")
     print(df.groupby("method").mean())
 
     visualize_optimality_gaps(df)  # Plot the results
