@@ -155,6 +155,37 @@ def dummy_perm_compilation(
     )
     return {"n_rep": n_rep} | collect_circuit_data(circ_out) | {"method": "dummy-perm"}
 
+def rl_compilation(circuit: Circuit, topology: Topology, n_rep: int):
+    """Use the RL agent to compile the circuit."""
+    tableau = tableau_from_circuit(CliffordTableau(circuit.n_qubits), circuit)
+    env = CliffordTableauEnv(
+        n_qubits=circuit.n_qubits,
+        nr_gates=0,
+        topology=topology,
+        cx_penalty=0.0,
+        h_penalty=0.0,
+        s_penalty=0.0,
+        final_reward=0.0
+    )
+    env.clifford_tableau_to_reduce = tableau.inverse()
+    env.final_circuit = Circuit(circuit.n_qubits)
+    env.final_cx = None
+    env.allowed_rows = list(range(circuit.n_qubits))
+    env.allowed_cols = list(range(circuit.n_qubits))
+    env.qubits_reduced = 0
+    env.graph = env.topology.to_nx
+    env.adjacency_matrix = nx.adjacency_matrix(env.graph).toarray()
+
+    def pick_pivot(G, remaining, rows, choice_fn=min):
+        obs = env._get_obs()
+        row, col = agent.act(obs, env.allowed_rows, env.allowed_cols, explore=False)
+        env.allowed_rows.remove(row)
+        env.allowed_cols.remove(col)
+        env.graph.remove_node(col)
+        return row, col
+
+    circ_out = synthesize_tableau_perm_row_col(tableau, topology, pick_pivot_callback=pick_pivot)
+    return {"n_rep": n_rep, "method": "rl_model", **collect_circuit_data(circ_out)}
 
 def visualize_optimality_gaps(df):
     """
@@ -231,7 +262,7 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
 
     # If want to use pre-trained model, uncomment the following lines.
     # The 4-qubit model `ordered_permutation_model.pth` is ready to use.
-    checkpoint = torch.load("src/ordered_permutation_model.pth", map_location=device)
+    checkpoint = torch.load("ordered_permutation_model.pth", map_location=device)
     print(type(checkpoint))
     if isinstance(checkpoint, dict):
         print(checkpoint.keys())
@@ -243,6 +274,11 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
         columns=["n_rep", "num_qubits", "method", "h", "s", "cx", "depth"]
     )
     topo = Topology.complete(n_qubits)
+    confusion_matrix = pd.DataFrame()
+    
+    if nr_gates > 20:
+        print("Warning: nr_gates > 20, RL agent only trained up to 20 gates complexity.")
+
     for i in range(cnt_eval):
         print(f"Iteration {i}")
         circuit = random_hscx_circuit(nr_qubits=n_qubits, nr_gates=nr_gates)
@@ -252,6 +288,7 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
             random_compilation,
             # nn_compilation,
             optimal_compilation,
+            rl_compilation,
             dummy_perm_compilation
         ]:
             if method_fn == dummy_perm_compilation:
@@ -263,6 +300,14 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
             print(f"{row['method']}: {row['cx']}", end=" | ")
         print("\n")
         
+        r1_score = method_scores["rl_model"]
+        optimum_score = method_scores["optimum"]
+
+        if optimum_score not in confusion_matrix.index or r1_score not in confusion_matrix.columns:
+            confusion_matrix.loc[optimum_score, r1_score] = 0
+
+        confusion_matrix.loc[optimum_score, r1_score] += 1
+
         # df_dictionary = pd.DataFrame(
         #     [dummy_perm_compilation(circuit.copy(), topo, i, sl_model)]
         # ) # Replace the above line with this line if using SL fine-tuning
