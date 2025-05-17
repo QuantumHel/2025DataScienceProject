@@ -1,60 +1,42 @@
-"""Code to possibly evaluate the NN training approach. Currently, this only compares our and the CNN compilation."""
-
+import os
 import warnings
 from typing import List
-
+import networkx as nx
 import numpy as np
 import pandas as pd
+import torch
+
 from pauliopt.circuits import Circuit
 from pauliopt.clifford.tableau import CliffordTableau
 from pauliopt.clifford.tableau_synthesis import synthesize_tableau_perm_row_col
 from pauliopt.topologies import Topology
 
+from src.rl.env import CliffordTableauEnv
+from src.rl.agent import DQNAgent
 from src.nn.brute_force_data import get_best_cnots
 from src.utils import random_hscx_circuit, tableau_from_circuit
 
-# from src.nn.permutation_pred3 import predict_permutation, pretrain_a_model, FlexibleGNN
+# Suppress warnings
+np.seterr(over='ignore')
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
-# from src.nn.permutation_pred2 import (
-#     pretrain_a_model,
-#     predict_permutation,
-#     PermutationConstrainedGNN,
-# )
+model_path = "models/best_model.pt"
+checkpoint = torch.load(model_path, map_location=torch.device("cpu"))
+CONFIG = checkpoint["config"]
 
-# from src.nn.permutation_pred2_optm import predict_permutation, pretrain_a_model, PermutationGNN
+n_qubits = 4
+agent = DQNAgent(n_qubits=n_qubits, config=CONFIG)
+agent.model.load_state_dict(checkpoint["model_state_dict"])
+agent.model.eval()
+agent.epsilon = 0.0
 
-# from src.nn.permutation_pred2 import (
-#     predict_permutation,
-#     pretrain_a_model_from_file,
-#     SequentialPermutationGNN,
-# )
-
-from src.nn.permutation_math import (
-    predict_permutation,
-    pretrain_a_model_from_file,
-    OrderedPermutationTransformer,
-    TableauPermutationDataset,
-    supervised_cx_fine_tune,
-    predict_permutation_gumbel,
-    predict_permutation_beam,
-    entropy_guided_search,
-    ensemble_predict_permutation,
-    curriculum_train,
-    get_default_device,
-    predict_permutation_fixed_dismatch,
-)
-
-import torch
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-
-# Suppress all overflow warnings globally
-np.seterr(over="ignore")
-
-# Suppress FutureWarning
-warnings.simplefilter(action="ignore", category=FutureWarning)
-
+def pretty_print_circuit(circuit):
+    """Pretty print the circuit."""
+    print("Circuit:")
+    for gate in circuit.gates:
+        gate_type = gate.__class__.__name__
+        qubits = ", ".join(str(q) for q in gate.qubits)
+        print(f"  {gate_type} on qubit(s): {qubits}")
 
 def collect_circuit_data(circuit: Circuit) -> dict:
     circuit.final_permutation = None
@@ -67,298 +49,109 @@ def collect_circuit_data(circuit: Circuit) -> dict:
         "depth": circuit.to_qiskit().depth(),
     }
 
-
-# "number of repetitions", "repetition index"???
 def our_compilation(circuit: Circuit, topology: Topology, n_rep: int):
-    """
-    Compilation from previous paper as a baseline.
-
-    :param circuit:
-    :param topology:
-    :param n_rep:
-    :return:
-    """
-    clifford_tableau = CliffordTableau(circuit.n_qubits)
-    clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
-
-    circ_out = synthesize_tableau_perm_row_col(clifford_tableau, topology)
-    return (
-        {"n_rep": n_rep}
-        | collect_circuit_data(circ_out)
-        | {"method": "normal_heuristic"}
-    )
-
+    tableau = tableau_from_circuit(CliffordTableau(circuit.n_qubits), circuit)
+    circ_out = synthesize_tableau_perm_row_col(tableau, topology)
+    return {"n_rep": n_rep, "method": "normal_heuristic", **collect_circuit_data(circ_out)}
 
 def random_compilation(circuit: Circuit, topology: Topology, n_rep: int):
-    """
-    Brute force compilation of the circuit (may be slow for >=4 qubits!)
-    :param circuit:
-    :param topology:
-    :param n_rep:
-    :return:
-    """
-    clifford_tableau = CliffordTableau(circuit.n_qubits)
-    clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
+    tableau = tableau_from_circuit(CliffordTableau(circuit.n_qubits), circuit)
+    def random_pick(G, remaining, rows, choice_fn=min):
+        row = np.random.choice(rows)
+        return row, row
+    circ_out = synthesize_tableau_perm_row_col(tableau, topology, pick_pivot_callback=random_pick)
+    return {"n_rep": n_rep, "method": "random", **collect_circuit_data(circ_out)}
 
-    def pick_pivot_callback(
-        G, remaining: "CliffordTableau", remaining_rows: List[int], choice_fn=min
-    ):
-        row = np.random.choice(remaining_rows)
-        col = row
-        return row, col
-
-    circ_out = synthesize_tableau_perm_row_col(
-        clifford_tableau, topology, pick_pivot_callback=pick_pivot_callback
-    )
-    return {"n_rep": n_rep} | collect_circuit_data(circ_out) | {"method": "random"}
-
-
-# Bruteforce compilation, of course it is the optimal...
 def optimal_compilation(circuit: Circuit, topology: Topology, n_rep: int):
-    """
-    Brute force compilation of the circuit (may be slow for >=4 qubits!)
-    :param circuit:
-    :param topology:
-    :param n_rep:
-    :return:
-    """
-    clifford_tableau = CliffordTableau(circuit.n_qubits)
-    clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
+    tableau = tableau_from_circuit(CliffordTableau(circuit.n_qubits), circuit)
+    best_perm, _ = get_best_cnots(tableau.inverse().inverse(), topology)[0]
+    best_perm = iter(best_perm)
+    def best_pick(G, remaining, rows, choice_fn=min):
+        return next(best_perm)
+    circ_out = synthesize_tableau_perm_row_col(tableau, topology, pick_pivot_callback=best_pick)
+    return {"n_rep": n_rep, "method": "optimum", **collect_circuit_data(circ_out)}
 
-    best_permutation, score = get_best_cnots(
-        clifford_tableau.inverse().inverse(), topology
-    )[0]
+def rl_compilation(circuit: Circuit, topology: Topology, n_rep: int):
+    """Use the RL agent to compile the circuit."""
+    tableau = tableau_from_circuit(CliffordTableau(circuit.n_qubits), circuit)
+    env = CliffordTableauEnv(
+        n_qubits=circuit.n_qubits,
+        nr_gates=0,
+        topology=topology,
+        cx_penalty=0.0,
+        h_penalty=0.0,
+        s_penalty=0.0,
+        final_reward=0.0
+    )
+    env.clifford_tableau_to_reduce = tableau.inverse()
+    env.final_circuit = Circuit(circuit.n_qubits)
+    env.final_cx = None
+    env.allowed_rows = list(range(circuit.n_qubits))
+    env.allowed_cols = list(range(circuit.n_qubits))
+    env.qubits_reduced = 0
+    env.graph = env.topology.to_nx
+    env.adjacency_matrix = nx.adjacency_matrix(env.graph).toarray()
 
-    # print_perm = get_best_cnots(clifford_tableau.inverse().inverse(), topology)
-    # print(f"best_permutation: {print_perm}")
-
-    best_permutation = iter(best_permutation)
-
-    def pick_pivot_callback(
-        G, remaining: "CliffordTableau", remaining_rows: List[int], choice_fn=min
-    ):
-        row, col = next(best_permutation)
+    def pick_pivot(G, remaining, rows, choice_fn=min):
+        obs = env._get_obs()
+        row, col = agent.act(obs, env.allowed_rows, env.allowed_cols, explore=False)
+        env.allowed_rows.remove(row)
+        env.allowed_cols.remove(col)
+        env.graph.remove_node(col)
         return row, col
 
-    circ_out = synthesize_tableau_perm_row_col(
-        clifford_tableau, topology, pick_pivot_callback=pick_pivot_callback
-    )
-    return {"n_rep": n_rep} | collect_circuit_data(circ_out) | {"method": "optimum"}
+    circ_out = synthesize_tableau_perm_row_col(tableau, topology, pick_pivot_callback=pick_pivot)
+    return {"n_rep": n_rep, "method": "rl_model", **collect_circuit_data(circ_out)}
 
+def main(n_qubits: int = 4, nr_gates: int = 10):
+    df = pd.DataFrame(columns=["n_rep", "num_qubits", "method", "h", "s", "cx", "depth"])
+    topology = Topology.complete(n_qubits)
 
-def dummy_perm_compilation(
-    circuit: Circuit,
-    topology: Topology,
-    n_rep: int,
-    model: OrderedPermutationTransformer,
-    device,
-):
-    clifford_tableau = CliffordTableau(circuit.n_qubits)
-    clifford_tableau = tableau_from_circuit(clifford_tableau, circuit)
-    # best_permutation = predict_permutation_gumbel(model, clifford_tableau, device)
-    best_permutation = predict_permutation_fixed_dismatch(
-        model, clifford_tableau, device
-    )
-    # best_permutation = predict_permutation_beam(model, clifford_tableau, device)
-    # best_permutation = entropy_guided_search(model, clifford_tableau, device)
-    # best_permutation = ensemble_predict_permutation(model, clifford_tableau, device)
-    # print(best_permutation)
+    # Initialize confusion matrix-like structure for RL vs. Optimum scores
+    confusion_matrix = pd.DataFrame() 
+    if nr_gates > 20: print("Warning: nr_gates > 20, RL agent only trained up to 20 gate compexity.")  
 
-    best_permutation = iter(best_permutation[0])
-
-    def pick_pivot_callback(
-        G, remaining: "CliffordTableau", remaining_rows: List[int], choice_fn=min
-    ):
-        row, col = next(best_permutation)
-        return row, col
-
-    circ_out = synthesize_tableau_perm_row_col(
-        clifford_tableau, topology, pick_pivot_callback=pick_pivot_callback
-    )
-    return {"n_rep": n_rep} | collect_circuit_data(circ_out) | {"method": "dummy-perm"}
-
-
-def add_cx_trend_plot(df):
-    # Set up the plot style
-    plt.figure(figsize=(12, 7))
-    sns.set_style("whitegrid")
-
-    # Get data for each method
-    methods = ["normal_heuristic", "dummy-perm", "combined_min", "optimum"]
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
-    labels = ["Standard Heuristic", "Neural Network", "Combined Method", "Optimum"]
-
-    # for method, color, label in zip(methods, colors, labels):
-    #     # Extract data for this method
-    #     method_df = df[df["method"] == method].sort_values("n_rep")
-
-    #     # Plot CX count trend
-    #     plt.plot(
-    #         method_df["n_rep"], method_df["cx"], color=color, alpha=0.7, label=label
-    #     )
-
-    #     # Add rolling average for clarity
-    #     rolling_avg = method_df["cx"].rolling(window=50, min_periods=1).mean()
-    #     plt.plot(method_df["n_rep"], rolling_avg, color=color, linewidth=2.5)
-
-    for method, color, label in zip(methods, colors, labels):
-        # Extract data for this method
-        method_df = df[df["method"] == method].sort_values("n_rep")
-
-        # Calculate rolling statistics
-        rolling_avg = method_df["cx"].rolling(window=50, min_periods=1).mean()
-        rolling_std = method_df["cx"].rolling(window=50, min_periods=1).std()
-
-        # Plot the mean line
-        plt.plot(
-            method_df["n_rep"], rolling_avg, color=color, linewidth=2.5, label=label
-        )
-
-        # Add shaded area for standard deviation
-        plt.fill_between(
-            method_df["n_rep"],
-            rolling_avg - rolling_std,
-            rolling_avg + rolling_std,
-            color=color,
-            alpha=0.2,
-        )
-
-    # Add titles and labels
-    plt.title("CX Gate Count Comparison Across Compilation Methods", fontsize=16)
-    plt.xlabel("Circuit Evaluation Index", fontsize=14)
-    plt.ylabel("Number of CX Gates", fontsize=14)
-    plt.legend(fontsize=12)
-
-    # Add statistics in text box
-    stats_text = "Mean CX Count:\n"
-    for method, label in zip(methods, labels):
-        mean_cx = df[df["method"] == method]["cx"].mean()
-        stats_text += f"{label}: {mean_cx:.2f}\n"
-
-    plt.figtext(
-        0.02, 0.02, stats_text, fontsize=12, bbox=dict(facecolor="white", alpha=0.8)
-    )
-
-    # Save the figure
-    plt.tight_layout()
-    plt.savefig("cx_count_comparison.png", dpi=300)
-    plt.show()
-
-
-def main(n_qubits: int = 4, nr_gates: int = 1000):
-    """
-    Execute a single experiment with random clifford circuits and store the respective gate count into a dataframe
-    :param n_qubits:
-    :param nr_gates:
-    :return:
-    """
-
-    device = get_default_device()  # mps seems not working well???
-    device = "cpu"
-    # Pre-train a model
-    # model = pretrain_a_model_from_file("nn/training_data_perm.pkl", None, 100, device)
-    # model = curriculum_train(
-    #     "nn/training_data_perm.pkl", max_samples=None, epochs_per_stage=25
-    # )
-    # sl_dataset = TableauPermutationDataset(
-    #     "nn/training_data_perm_4_qubit.pkl", n_qubits=4, max_samples=320
-    # )
-    # sl_model = supervised_cx_fine_tune(model, sl_dataset, epochs=50, device="cpu")
-
-    checkpoint = torch.load(
-        "ordered_permutation_model_100_earlystop_butno.pth", map_location="cpu"
-    )
-    print(type(checkpoint))
-    if isinstance(checkpoint, dict):
-        print(checkpoint.keys())
-    model = OrderedPermutationTransformer(n_qubits=n_qubits, dim=256, num_layers=12)
-    model.load_state_dict(checkpoint)
-    model.eval()
-
-    df = pd.DataFrame(
-        columns=["n_rep", "num_qubits", "method", "h", "s", "cx", "depth"]
-    )
-    topo = Topology.complete(n_qubits)
-    for i in range(1):
+    for i in range(1000):
+        print(f"Iteration {i}")
         circuit = random_hscx_circuit(nr_qubits=n_qubits, nr_gates=nr_gates)
 
-        # Our compilation e.g. the baseline from the paper
-        df_dictionary = pd.DataFrame([our_compilation(circuit.copy(), topo, i)])
-        df = pd.concat([df, df_dictionary], ignore_index=True)
-        print("Min", df_dictionary["cx"])
+        # Store scores for each method
+        method_scores = {}
+        for method_fn in [our_compilation, optimal_compilation, random_compilation, rl_compilation]:
+            row = method_fn(circuit.copy(), topology, i)
+            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            method_scores[row["method"]] = row["cx"]
+            print(f"{row['method']}: {row['cx']}", end=" | ")
+        print("\n")
 
-        # Optimal compilation
-        df_dictionary = pd.DataFrame([optimal_compilation(circuit.copy(), topo, i)])
-        df = pd.concat([df, df_dictionary], ignore_index=True)
-        print("OPTIMUM", df_dictionary["cx"])
+        # Compare RL score to the optimum score
+        rl_score = method_scores["rl_model"]
+        optimum_score = method_scores["optimum"]
 
-        # Random compilation
-        df_dictionary = pd.DataFrame([random_compilation(circuit.copy(), topo, i)])
-        df = pd.concat([df, df_dictionary], ignore_index=True)
-        print("Random", df_dictionary["cx"])
+        # Update confusion matrix-like structure
+        if optimum_score not in confusion_matrix.index or rl_score not in confusion_matrix.columns:
+            confusion_matrix.loc[optimum_score, rl_score] = 0
 
-        # # Group's first ANN compilation
-        # df_dictionary = pd.DataFrame([nn_compilation(circuit.copy(), topo, i)])
-        # df = pd.concat([df, df_dictionary], ignore_index=True)
-        # print("NN", df_dictionary["cx"])
+        confusion_matrix.loc[optimum_score, rl_score] += 1
 
-        # Dummy_perm compilation
-        df_dictionary = pd.DataFrame(
-            [dummy_perm_compilation(circuit.copy(), topo, i, model, device)]
-        )
-        # df_dictionary = pd.DataFrame(
-        #     [dummy_perm_compilation(circuit.copy(), topo, i, sl_model)]
-        # ) # Uncomment this line to use the model with SL fine-tuning
-        df = pd.concat([df, df_dictionary], ignore_index=True)
-        print("Dummy-perm", df_dictionary["cx"])
+        # Print circuit if RL score is +5 worse than optimum
+        score_diff = rl_score - optimum_score
+        #if score_diff >= 5:
+            #print(f"RL score is significantly worse (+{score_diff}) than optimum. Circuit:")
+            #pretty_print_circuit(circuit)
 
-    # Convert the cx column to a numerical type
-    df["cx"] = pd.to_numeric(df["cx"])
-
-    # Create a combined method from existing results
-    combined_results = []
-    for rep in df["n_rep"].unique():
-        # Get results for this circuit
-        circuit_df = df[df["n_rep"] == rep]
-        # Get rows for both methods
-        heuristic_row = circuit_df[circuit_df["method"] == "normal_heuristic"].iloc[0]
-        dummy_row = circuit_df[circuit_df["method"] == "dummy-perm"].iloc[0]
-        # Choose the better one
-        if heuristic_row["cx"] <= dummy_row["cx"]:
-            best_row = heuristic_row.copy()
-        else:
-            best_row = dummy_row.copy()
-        # Update the method name
-        best_row["method"] = "combined_min"
-        # Add to results
-        combined_results.append(best_row)
-    # Add combined results to the DataFrame
-    combined_df = pd.DataFrame(combined_results)
-    df = pd.concat([df, combined_df], ignore_index=True)
-
+    # Save results to CSV
     df.to_csv("test_clifford_synthesis.csv", index=False)
-    # Question: what should be the comparision metric? Mean, median, std, mse, etc.?
+
+    # Print confusion matrix
+    print("\nConfusion Matrix (Optimum vs RL Scores):")
+    confusion_matrix = confusion_matrix.sort_index(axis=0).sort_index(axis=1)
+    confusion_matrix = confusion_matrix.fillna(0)
+    print(confusion_matrix)
+
+    # Print mean scores grouped by method
+    print("\nMean Scores by Method:")
     print(df.groupby("method").mean())
-
-    add_cx_trend_plot(df)  # Plot the results
-
-    # Is the difference just luck?
-    from scipy.stats import ttest_ind
-
-    nn_cx_values = df[df["method"] == "nn"]["cx"]
-    random_cx_values = df[df["method"] == "random"]["cx"]
-    t_stat, p_value = ttest_ind(nn_cx_values, random_cx_values)
-
-    print(f"T-test results: t-statistic = {t_stat}, p-value = {p_value}")
-    if p_value < 0.05:
-        print(
-            "The difference in cx values between nn and random is statistically significant (p < 0.05)."
-        )
-    else:
-        print(
-            "The difference in cx values between nn and random is not statistically significant (p >= 0.05)."
-        )
-
 
 if __name__ == "__main__":
     main()
