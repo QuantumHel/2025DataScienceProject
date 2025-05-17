@@ -2,17 +2,22 @@
 
 import warnings
 from typing import List
-
+import networkx as nx
 import numpy as np
 import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 from pauliopt.circuits import Circuit
 from pauliopt.clifford.tableau import CliffordTableau
 from pauliopt.clifford.tableau_synthesis import synthesize_tableau_perm_row_col
 from pauliopt.topologies import Topology
 
+from src.rl.env import CliffordTableauEnv
+from src.rl.agent import DQNAgent
 from src.nn.brute_force_data import get_best_cnots
 from src.utils import random_hscx_circuit, tableau_from_circuit
-
 
 from src.nn.permutation_clean import (
     pretrain_a_model_from_file,
@@ -25,16 +30,20 @@ from src.nn.permutation_clean import (
     curriculum_train,
 )
 
-import torch
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-
 # Suppress all overflow warnings globally
 np.seterr(over="ignore")
 
 # Suppress FutureWarning
 warnings.simplefilter(action="ignore", category=FutureWarning)
+
+model_path = "models/finetuned_model_up_to_nr_gates_10.pt"
+checkpoint = torch.load(model_path, map_location=torch.device("cpu"))
+CONFIG = checkpoint["config"]
+n_qubits = 4
+agent = DQNAgent(n_qubits=n_qubits, config=CONFIG)
+agent.model.load_state_dict(checkpoint["model_state_dict"])
+agent.model.eval()
+agent.epsilon = 0.0
 
 
 def collect_circuit_data(circuit: Circuit) -> dict:
@@ -197,9 +206,9 @@ def visualize_optimality_gaps(df):
     sns.set_style("whitegrid")
 
     # Extract the methods we care about
-    methods = ["normal_heuristic", "dummy-perm", "combined_min", "optimum"]
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
-    labels = ["Standard Heuristic", "Neural Network", "Combined", "Optimum"]
+    methods = ["normal_heuristic", "dummy-perm", "combined_min", "optimum","rl_model"]
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    labels = ["Standard Heuristic", "Neural Network", "Combined", "Optimum","RL Model"]
 
     # Plot main trends
     for method, color, label in zip(methods, colors, labels):
@@ -262,12 +271,12 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
 
     # If want to use pre-trained model, uncomment the following lines.
     # The 4-qubit model `ordered_permutation_model.pth` is ready to use.
-    checkpoint = torch.load("ordered_permutation_model.pth", map_location=device)
-    print(type(checkpoint))
-    if isinstance(checkpoint, dict):
-        print(checkpoint.keys())
+    checkpoint_perm = torch.load("src/ordered_permutation_model.pth", map_location=device)
+    print(type(checkpoint_perm))
+    if isinstance(checkpoint_perm, dict):
+        print(checkpoint_perm.keys())
     model = OrderedPermutationTransformer(n_qubits=n_qubits, dim=256, num_layers=12)
-    model.load_state_dict(checkpoint)
+    model.load_state_dict(checkpoint_perm)
     model.eval()
 
     df = pd.DataFrame(
