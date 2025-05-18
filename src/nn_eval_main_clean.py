@@ -272,9 +272,9 @@ def main(n_qubits: int = 4, nr_gates: int = 1000):
     # If want to use pre-trained model, uncomment the following lines.
     # The 4-qubit model `ordered_permutation_model.pth` is ready to use.
     checkpoint_perm = torch.load("models/ordered_permutation_model.pth", map_location=device)
-    print(type(checkpoint_perm))
-    if isinstance(checkpoint_perm, dict):
-        print(checkpoint_perm.keys())
+    #print(type(checkpoint_perm))
+    #if isinstance(checkpoint_perm, dict):
+    #    print(checkpoint_perm.keys())
     model = OrderedPermutationTransformer(n_qubits=n_qubits, dim=256, num_layers=12)
     model.load_state_dict(checkpoint_perm)
     model.eval()
